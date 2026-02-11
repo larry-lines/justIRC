@@ -93,15 +93,18 @@ This document outlines planned improvements and future development for JustIRC. 
   - File size limits and validation
   - Progress bars for large transfers
 
-#### Voice & Video
-- [ ] **Voice Chat** (WebRTC)
-  - End-to-end encrypted voice calls
-  - Push-to-talk functionality
-  - Multiple participants support
+### Code Quality
+- [ ] **Refactoring**
+  - Split large files (client_gui.py: 2460 lines)
+  - Extract common utilities into shared module
+  - Reduce code duplication
+  - Improve error handling consistency
   
-- [ ] **Video Chat** (WebRTC)
-  - End-to-end encrypted video calls
-  - Screen sharing capability
+- [ ] **Architecture Improvements**
+  - Implement proper event bus/observer pattern
+  - Separate business logic from UI (MVC/MVP)
+  - Add dependency injection for testability
+  - Consider async/await improvements
 
 ### Performance & Scalability
 - [ ] **Server Performance**
@@ -142,17 +145,42 @@ This document outlines planned improvements and future development for JustIRC. 
   - Configurable font sizes
   - ARIA labels and semantic HTML (if web client)
 
-#### Multi-Platform
-- [ ] **Web Client**
-  - Browser-based client using WebSockets
-  - Progressive Web App (PWA) support
-  - Same E2E encryption as native clients
+---
+
+## 🔧 Stability & Polish (v1.3.0)
+
+### Advanced Cryptography
+- [ ] **Post-Quantum Cryptography**
+  - Add post-quantum key exchange (CRYSTALS-Kyber)
+  - Hybrid classic + PQC mode
+  - Future-proof against quantum computers
   
-- [ ] **Mobile Applications**
-  - Native iOS client (Swift)
-  - Native Android client (Kotlin)
-  - React Native cross-platform option
-  - Push notifications for mobile
+- [ ] **Enhanced Privacy**
+  - Onion routing for metadata protection
+  - Mixnet integration
+  - Timing attack mitigation
+  - Traffic pattern obfuscation
+
+### Bot Framework
+- [ ] **Bot API**
+  - Python SDK for bot development
+  - Webhook support for bots
+  - Bot permission system
+  - Example bots (moderation, games, utilities)
+
+---
+
+## 🎙️ Communications (v1.5.0)
+
+### Voice & Video
+- [ ] **Voice Chat** (WebRTC)
+  - End-to-end encrypted voice calls
+  - Push-to-talk functionality
+  - Multiple participants support
+  
+- [ ] **Video Chat** (WebRTC)
+  - End-to-end encrypted video calls
+  - Screen sharing capability
 
 ---
 
@@ -173,24 +201,17 @@ This document outlines planned improvements and future development for JustIRC. 
   - No central server requirement
   - Hybrid P2P + server mode
 
-#### Advanced Crypto
-- [ ] **Post-Quantum Cryptography**
-  - Add post-quantum key exchange (CRYSTALS-Kyber)
-  - Hybrid classic + PQC mode
-  - Future-proof against quantum computers
+#### Multi-Platform
+- [ ] **Web Client**
+  - Browser-based client using WebSockets
+  - Progressive Web App (PWA) support
+  - Same E2E encryption as native clients
   
-- [ ] **Enhanced Privacy**
-  - Onion routing for metadata protection
-  - Mixnet integration
-  - Timing attack mitigation
-  - Traffic pattern obfuscation
-
-#### Bot Framework
-- [ ] **Bot API**
-  - Python SDK for bot development
-  - Webhook support for bots
-  - Bot permission system
-  - Example bots (moderation, games, utilities)
+- [ ] **Mobile Applications**
+  - Native iOS client (Swift)
+  - Native Android client (Kotlin)
+  - React Native cross-platform option
+  - Push notifications for mobile
 
 #### Enterprise Features
 - [ ] **Enterprise Management**
@@ -287,19 +308,6 @@ This document outlines planned improvements and future development for JustIRC. 
 
 ## 📊 Technical Debt & Maintenance
 
-### Code Quality
-- [ ] **Refactoring**
-  - Split large files (client_gui.py: 2460 lines)
-  - Extract common utilities into shared module
-  - Reduce code duplication
-  - Improve error handling consistency
-  
-- [ ] **Architecture Improvements**
-  - Implement proper event bus/observer pattern
-  - Separate business logic from UI (MVC/MVP)
-  - Add dependency injection for testability
-  - Consider async/await improvements
-
 ### Dependencies
 - [ ] **Dependency Management**
   - Regular security audits (Dependabot)
@@ -346,9 +354,11 @@ We welcome community input! If you have ideas for features or improvements:
 
 ## 📅 Release Schedule
 
-- **v1.1.0** - Q1 2026 (Testing, Security, Documentation)
-- **v1.2.0** - Q2 2026 (Features, Performance, UX)
-- **v2.0.0** - Q4 2026 (Federation, P2P, Advanced Features)
+- **v1.1.0** - Q1 2026 (Testing, Security, Documentation) ✅
+- **v1.2.0** - Q2 2026 (Features, Performance, UX, Code Quality)
+- **v1.3.0** - Q3 2026 (Advanced Crypto, Bot Framework)
+- **v1.5.0** - Q4 2026 (Voice & Video Communication)
+- **v2.0.0** - Q1 2027 (Federation, P2P, Multi-Platform, Advanced Features)
 
 **Note:** This roadmap is a living document and priorities may shift based on community needs, security requirements, and resource availability.
 
