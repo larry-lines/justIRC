@@ -105,11 +105,15 @@
     "show_timestamps": true,
     "show_join_leave": true,
     "sound_notifications": false,
-    "compact_mode": false
+    "compact_mode": false,
+    "inactivity_timeout": 3600
   },
   "server": {
     "last_server": "localhost",
     "last_port": "6667",
-    "last_nickname": ""
-  }
+    "last_nickname": ""  },
+  "history": {
+    "enabled": false,
+    "encrypted": false,
+    "password": null  }
 }

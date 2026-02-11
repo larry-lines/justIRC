@@ -16,6 +16,7 @@ from protocol import Protocol, MessageType
 from crypto_layer import CryptoLayer
 from image_transfer import ImageTransfer
 from config_manager import ConfigManager
+from message_history import MessageHistory
 
 
 class IRCClientGUI:
@@ -51,6 +52,16 @@ class IRCClientGUI:
         
         # Pending image transfers waiting for user acceptance
         self.pending_images = {}  # image_id -> {from_id, metadata, chunks_data}
+        
+        # Message history (optional)
+        self.history = None
+        if self.config.get("history", "enabled", default=False):
+            history_encrypted = self.config.get("history", "encrypted", default=False)
+            history_password = self.config.get("history", "password", default=None) if history_encrypted else None
+            try:
+                self.history = MessageHistory(password=history_password)
+            except Exception as e:
+                print(f"Failed to initialize message history: {e}")
         
         # Event loop
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -584,6 +595,71 @@ class IRCClientGUI:
         ttk.Checkbutton(ui_frame, text="Show timestamps", variable=timestamps_var).pack(anchor=tk.W, pady=5)
         ttk.Checkbutton(ui_frame, text="Show join/leave messages", variable=join_leave_var).pack(anchor=tk.W, pady=5)
         
+        ttk.Label(ui_frame, text="Inactivity Timeout (minutes):", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(15, 5))
+        timeout_var = tk.IntVar(value=self.config.get("ui", "inactivity_timeout", default=3600) // 60)
+        timeout_frame = ttk.Frame(ui_frame)
+        timeout_frame.pack(anchor=tk.W)
+        ttk.Scale(
+            timeout_frame,
+            from_=1,
+            to=120,
+            variable=timeout_var,
+            orient=tk.HORIZONTAL,
+            length=200
+        ).pack(side=tk.LEFT)
+        timeout_label = ttk.Label(timeout_frame, text=f"{timeout_var.get()} min")
+        timeout_label.pack(side=tk.LEFT, padx=10)
+        
+        def update_timeout_label(*args):
+            timeout_label.config(text=f"{timeout_var.get()} min")
+        timeout_var.trace('w', update_timeout_label)
+        
+        # History tab
+        history_frame = ttk.Frame(notebook, padding=20)
+        notebook.add(history_frame, text="History")
+        
+        ttk.Label(history_frame, text="Message History:", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(0, 10))
+        
+        history_enabled_var = tk.BooleanVar(value=self.config.get("history", "enabled", default=False))
+        history_encrypted_var = tk.BooleanVar(value=self.config.get("history", "encrypted", default=False))
+        
+        ttk.Checkbutton(history_frame, text="Enable message history", variable=history_enabled_var).pack(anchor=tk.W, pady=5)
+        ttk.Checkbutton(history_frame, text="Encrypt history (requires password)", variable=history_encrypted_var).pack(anchor=tk.W, pady=5)
+        
+        ttk.Label(history_frame, text="History password (optional):", font=('Arial', 9)).pack(anchor=tk.W, pady=(10, 5))
+        history_password_var = tk.StringVar(value=self.config.get("history", "password", default=""))
+        history_password_entry = ttk.Entry(history_frame, textvariable=history_password_var, show="*", width=30)
+        history_password_entry.pack(anchor=tk.W)
+        
+        ttk.Label(
+            history_frame, 
+            text="Note: Restart required for history changes to take effect.",
+            font=('Arial', 8, 'italic'),
+            foreground="gray"
+        ).pack(anchor=tk.W, pady=(10, 0))
+        
+        # Show history stats if enabled
+        if self.history:
+            stats = self.history.get_statistics()
+            stats_text = f"\nCurrent History Stats:\n"
+            stats_text += f"  • Total messages: {stats['total_messages']}\n"
+            stats_text += f"  • Total channels: {stats['total_channels']}\n"
+            if stats['oldest_message']:
+                stats_text += f"  • Oldest message: {stats['oldest_message'].strftime('%Y-%m-%d %H:%M')}\n"
+            if stats['newest_message']:
+                stats_text += f"  • Newest message: {stats['newest_message'].strftime('%Y-%m-%d %H:%M')}\n"
+            stats_text += f"  • Encrypted: {'Yes' if stats['encrypted'] else 'No'}"
+            
+            ttk.Label(history_frame, text=stats_text, font=('Arial', 9)).pack(anchor=tk.W, pady=(10, 0))
+            
+            # Clear history button
+            def clear_history():
+                if messagebox.askyesno("Clear History", "Are you sure you want to clear all message history? This cannot be undone."):
+                    self.history.clear_history()
+                    messagebox.showinfo("Success", "Message history cleared")
+            
+            ttk.Button(history_frame, text="Clear All History", command=clear_history).pack(anchor=tk.W, pady=(10, 0))
+        
         # Buttons
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(fill=tk.X, padx=10, pady=10)
@@ -594,6 +670,11 @@ class IRCClientGUI:
             self.config.set("font", "chat_size", value=font_size_var.get())
             self.config.set("ui", "show_timestamps", value=timestamps_var.get())
             self.config.set("ui", "show_join_leave", value=join_leave_var.get())
+            self.config.set("ui", "inactivity_timeout", value=timeout_var.get() * 60)
+            self.config.set("history", "enabled", value=history_enabled_var.get())
+            self.config.set("history", "encrypted", value=history_encrypted_var.get())
+            if history_password_var.get():
+                self.config.set("history", "password", value=history_password_var.get())
             self.apply_theme()
             
             # Update font
@@ -647,6 +728,11 @@ class IRCClientGUI:
   /users                     - List all online users
   /whois user                - Get user information and channels
   /list                      - List all available channels (🔒 = password-protected)
+  
+🔹 Message History (if enabled):
+  /history [limit]           - Show message history (default: 50 messages)
+  /search query              - Search message history
+  /export                    - Export message history to file
   
 🔹 File Transfer:
   /image user path           - Send encrypted image
@@ -1018,6 +1104,18 @@ class IRCClientGUI:
         """Add structured chat message with colored nickname"""
         from datetime import datetime
         
+        # Save to history if enabled
+        if self.history:
+            try:
+                self.history.add_message(
+                    sender=sender, 
+                    content=message, 
+                    channel=channel, 
+                    message_type=msg_type
+                )
+            except Exception as e:
+                print(f"Failed to save message to history: {e}")
+        
         self.chat_display.config(state=tk.NORMAL)
         
         # Add timestamp
@@ -1370,9 +1468,15 @@ class IRCClientGUI:
             if user_id and user_id in self.users:
                 del self.users[user_id]
             
-            # Remove from all channel tracking
-            for channel in self.channel_users.values():
-                channel.discard(user_id)
+            # Remove from all channel tracking (iterate over channel names, not values)
+            for channel_name in list(self.channel_users.keys()):
+                self.channel_users[channel_name].discard(user_id)
+            
+            # Remove from operator and mod tracking
+            for channel_name in list(self.channel_operators.keys()):
+                self.channel_operators[channel_name].discard(user_id)
+            for channel_name in list(self.channel_mods.keys()):
+                self.channel_mods[channel_name].discard(user_id)
             
             # Update both user lists
             self.root.after(0, self._update_user_list)
@@ -1744,6 +1848,9 @@ class IRCClientGUI:
                 return
             parts = args.split(maxsplit=2)
             channel = parts[0]
+            # Prepend '#' if not already present
+            if not channel.startswith('#'):
+                channel = '#' + channel
             join_password = parts[1] if len(parts) > 1 else None
             creator_password = parts[2] if len(parts) > 2 else join_password  # If only one password, use for both
             await self._join_channel(channel, join_password, creator_password)
@@ -1881,6 +1988,78 @@ class IRCClientGUI:
             target_nickname = args.strip()
             msg = Protocol.build_message(MessageType.TRANSFER_OWNERSHIP, channel=self.current_channel, target_nickname=target_nickname)
             await self.send_to_server(msg)
+        
+        elif cmd == '/history':
+            # Show message history
+            if not self.history:
+                self.root.after(0, lambda: self.log("Message history is not enabled. Enable it in settings.", "error"))
+                return
+            
+            limit = 50
+            if args:
+                try:
+                    limit = int(args.strip())
+                except ValueError:
+                    self.root.after(0, lambda: self.log("Usage: /history [limit]", "error"))
+                    return
+            
+            messages = self.history.get_messages(channel=self.current_channel, limit=limit)
+            if messages:
+                self.root.after(0, lambda: self.log(f"=== Last {len(messages)} messages ===", "info"))
+                for msg in messages:
+                    timestamp = msg['datetime'].strftime('%H:%M:%S')
+                    ch = f"[{msg['channel']}] " if msg['channel'] else "[PM] "
+                    self. root.after(0, lambda t=timestamp, c=ch, s=msg['sender'], m=msg['content']: 
+                                    self.log(f"{t} {c}<{s}> {m}", "info"))
+            else:
+                self.root.after(0, lambda: self.log("No message history found", "info"))
+        
+        elif cmd == '/search':
+            # Search message history
+            if not self.history:
+                self.root.after(0, lambda: self.log("Message history is not enabled. Enable it in settings.", "error"))
+                return
+            
+            if not args:
+                self.root.after(0, lambda: self.log("Usage: /search <query>", "error"))
+                return
+            
+            query = args.strip()
+            messages = self.history.search_messages(query, channel=self.current_channel, limit=30)
+            if messages:
+                self.root.after(0, lambda: self.log(f"=== Found {len(messages)} messages matching '{query}' ===", "info"))
+                for msg in messages:
+                    timestamp = msg['datetime'].strftime('%Y-%m-%d %H:%M')
+                    ch = f"[{msg['channel']}] " if msg['channel'] else "[PM] "
+                    self.root.after(0, lambda t=timestamp, c=ch, s=msg['sender'], m=msg['content']: 
+                                    self.log(f"{t} {c}<{s}> {m}", "info"))
+            else:
+                self.root.after(0, lambda: self.log(f"No messages found matching '{query}'", "info"))
+        
+        elif cmd == '/export':
+            # Export message history
+            if not self.history:
+                self.root.after(0, lambda: self.log("Message history is not enabled. Enable it in settings.", "error"))
+                return
+            
+            # Show file dialog
+            def do_export():
+                filepath = filedialog.asksaveasfilename(
+                    title="Export Message History",
+                    defaultextension=".txt",
+                    filetypes=[("Text files", "*.txt"), ("JSON files", "*.json"), ("All files", "*.*")]
+                )
+                if filepath:
+                    try:
+                        if filepath.endswith('.json'):
+                            self.history.export_to_json(filepath, channel=self.current_channel)
+                        else:
+                            self.history.export_to_text(filepath, channel=self.current_channel)
+                        self.log(f"History exported to {filepath}", "success")
+                    except Exception as e:
+                        self.log(f"Export failed: {e}", "error")
+            
+            self.root.after(0, do_export)
         
         elif cmd == '/quit':
             self.running = False
@@ -2055,6 +2234,9 @@ class IRCClientGUI:
         
         def on_join():
             channel = channel_entry.get().strip()
+            # Prepend '#' if not already present
+            if channel and not channel.startswith('#'):
+                channel = '#' + channel
             join_pwd = join_password_entry.get().strip() or None
             creator_pwd = creator_password_entry.get().strip() or None
             

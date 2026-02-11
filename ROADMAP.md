@@ -65,11 +65,11 @@ This document outlines planned improvements and future development for JustIRC. 
 ### Features
 
 #### Core Chat Features
-- [ ] **Message History & Persistence**
-  - Optional client-side encrypted message storage
-  - SQLite database for local message history
-  - Search through message history
-  - Export chat logs (encrypted format)
+- [x] **Message History & Persistence**
+  - ✅ Optional client-side encrypted message storage
+  - ✅ SQLite database for local message history
+  - ✅ Search through message history
+  - ✅ Export chat logs (encrypted format)
 
 - [ ] **Enhanced Channel Features**
   - Channel topics with permission controls

@@ -8,7 +8,7 @@
   "enable_authentication": false,
   "require_authentication": false,
   "enable_ip_whitelist": false,
-  "connection_timeout": 300,
-  "read_timeout": 60,
+  "connection_timeout": 3600,
+  "read_timeout": 3600,
   "max_message_size": 65536
 }
