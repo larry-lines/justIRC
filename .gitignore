@@ -21,6 +21,15 @@ wheels/
 *.egg
 MANIFEST
 
+# Packaging
+deb_dist/
+*.deb
+*.tar.gz
+*.dsc
+*.changes
+*.buildinfo
+justirc-*.tar.gz
+
 # Virtual Environment
 venv/
 ENV/
@@ -59,3 +68,7 @@ received_*
 Thumbs.db
 server_data/
 deploy/
+# Windows Build Environment
+build-env/
+python-installer.exe
+*.spec
