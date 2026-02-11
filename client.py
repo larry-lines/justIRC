@@ -139,6 +139,12 @@ class IRCClient:
         elif msg_type == MessageType.PUBLIC_KEY_RESPONSE.value:
             await self.handle_public_key_response(message)
         
+        elif msg_type == MessageType.REKEY_REQUEST.value:
+            await self.handle_rekey_request(message)
+        
+        elif msg_type == MessageType.REKEY_RESPONSE.value:
+            await self.handle_rekey_response(message)
+        
         elif msg_type == MessageType.PRIVATE_MESSAGE.value:
             await self.handle_private_message(message)
         
@@ -238,6 +244,73 @@ class IRCClient:
         
         self.users[user_id] = {'nickname': nickname, 'public_key': public_key}
         self.crypto.load_peer_public_key(user_id, public_key)
+    
+    async def handle_rekey_request(self, message: dict):
+        """Handle incoming key rotation request"""
+        from_id = message.get('from_id')
+        from_nickname = message.get('from_nickname')
+        new_public_key = message.get('new_public_key')
+        
+        if not from_id or not new_public_key:
+            self.print_error("Invalid rekey request received")
+            return
+        
+        # Load the new key
+        self.crypto.load_peer_public_key(from_id, new_public_key)
+        
+        # Rotate our own key for this peer
+        self.crypto.rotate_key_for_peer(from_id)
+        
+        # Send our new public key back
+        response = Protocol.rekey_response(
+            self.user_id,
+            from_id,
+            self.crypto.get_public_key_b64()
+        )
+        await self.send(response)
+        
+        self.print_info(f"🔐 Encryption keys rotated with {from_nickname}")
+    
+    async def handle_rekey_response(self, message: dict):
+        """Handle key rotation response"""
+        from_id = message.get('from_id')
+        from_nickname = message.get('from_nickname')
+        new_public_key = message.get('new_public_key')
+        
+        if not from_id or not new_public_key:
+            self.print_error("Invalid rekey response received")
+            return
+        
+        # Load the new key
+        self.crypto.load_peer_public_key(from_id, new_public_key)
+        
+        self.print_success(f"🔐 Encryption keys successfully rotated with {from_nickname}")
+    
+    async def initiate_key_rotation(self, target_nickname: str):
+        """Initiate key rotation with a user"""
+        # Find the target user
+        target_id = None
+        for user_id, info in self.users.items():
+            if info['nickname'] == target_nickname:
+                target_id = user_id
+                break
+        
+        if not target_id:
+            self.print_error(f"User {target_nickname} not found")
+            return
+        
+        # Rotate our key for this peer
+        self.crypto.rotate_key_for_peer(target_id)
+        
+        # Send rekey request with our new public key
+        request = Protocol.rekey_request(
+            self.user_id,
+            target_id,
+            self.crypto.get_public_key_b64()
+        )
+        await self.send(request)
+        
+        self.print_info(f"🔐 Requesting key rotation with {target_nickname}...")
     
     async def handle_private_message(self, message: dict):
         """Handle encrypted private message"""
@@ -646,6 +719,7 @@ Commands:
   /leave [channel]              Leave current or specified channel
   /msg <user> <message>         Send private message
   /image <user> <file>          Send image to user
+  /rekey <user>                 Rotate encryption keys with user (Perfect Forward Secrecy)
   /op <user>                    Grant operator status (no password needed, operators only)
   /kick <user> [reason]         Kick user from channel (operators only)
   /topic <new topic>            Set channel topic (operators only)
@@ -737,6 +811,13 @@ Operators: Channel creators are automatically operators
                 await self.send_image(parts[0], parts[1])
             else:
                 self.print_error("Usage: /image <user> <file>")
+        
+        elif cmd == '/rekey':
+            if not args:
+                self.print_error("Usage: /rekey <user>")
+            else:
+                target_nickname = args.strip()
+                await self.initiate_key_rotation(target_nickname)
         
         elif cmd == '/op':
             if not self.current_channel:

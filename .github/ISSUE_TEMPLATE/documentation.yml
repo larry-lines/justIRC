@@ -1,0 +1,54 @@
+---
+name: 📚 Documentation Improvement
+about: Suggest improvements to documentation
+title: '[DOCS] '
+labels: ['documentation', 'needs-triage']
+assignees: ''
+---
+
+## 📚 Documentation Issue
+
+Which documentation needs improvement?
+
+- [ ] README.md
+- [ ] API Documentation (docs/API.md)
+- [ ] Architecture Documentation (docs/ARCHITECTURE.md)
+- [ ] Deployment Guide (docs/DEPLOYMENT.md)
+- [ ] Developer Guide (docs/DEVELOPER.md)
+- [ ] Security Documentation (docs/SECURITY.md)
+- [ ] Code comments/docstrings
+- [ ] Other: _______________
+
+## 📍 Location
+
+Please specify the exact location of the documentation that needs improvement:
+- File: 
+- Section: 
+- Line numbers (if applicable): 
+
+## ❌ Current Problem
+
+What is wrong, missing, or unclear in the current documentation?
+
+## ✅ Proposed Improvement
+
+What should be added, changed, or clarified?
+
+## 🎯 Target Audience
+
+Who is this documentation for?
+- [ ] New users
+- [ ] Experienced users
+- [ ] System administrators
+- [ ] Developers/contributors
+- [ ] Security auditors
+
+## 📝 Additional Context
+
+Add any other context, examples, or screenshots that would help explain the improvement.
+
+## ✔️ Checklist
+
+- [ ] I have checked that this documentation hasn't been recently updated
+- [ ] I have provided a clear description of the issue
+- [ ] I am willing to submit a PR with the improvement (if applicable)

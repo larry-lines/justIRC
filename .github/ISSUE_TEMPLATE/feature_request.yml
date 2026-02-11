@@ -1,0 +1,64 @@
+---
+name: ✨ Feature Request
+about: Suggest a new feature or enhancement
+title: '[FEATURE] '
+labels: ['enhancement', 'needs-triage']
+assignees: ''
+---
+
+## ✨ Feature Description
+
+A clear and concise description of the feature you'd like to see.
+
+## 🎯 Problem / Use Case
+
+Is your feature request related to a problem? Please describe.
+
+Example: "I'm frustrated when [...]" or "It would be useful to [...]"
+
+## 💡 Proposed Solution
+
+Describe the solution you'd like to see implemented.
+
+## 🔄 Alternatives Considered
+
+Have you considered any alternative solutions or features? Describe them here.
+
+## 📐 Implementation Ideas
+
+If you have ideas about how this could be implemented, share them here:
+- Technical approach
+- API design
+- UI/UX mockups
+- Code snippets
+
+## 📊 Priority
+
+How important is this feature to you?
+
+- [ ] Low - Nice to have
+- [ ] Medium - Would improve my workflow
+- [ ] High - Critical for my use case
+
+## 🎨 Design / Mockups
+
+If applicable, add wireframes, mockups, or screenshots showing what you have in mind.
+
+## 🔗 Related Issues
+
+Are there any related issues or pull requests? Link them here.
+
+## 🌍 Impact
+
+Who would benefit from this feature?
+- [ ] End users
+- [ ] System administrators
+- [ ] Developers/contributors
+- [ ] Everyone
+
+## ✔️ Checklist
+
+- [ ] I have searched existing issues to ensure this is not a duplicate
+- [ ] I have checked the [ROADMAP.md](../ROADMAP.md) to see if this is already planned
+- [ ] I am willing to work on this feature (if applicable)
+- [ ] I have provided a clear use case and problem statement
