@@ -23,7 +23,7 @@ except FileNotFoundError:
 
 setup(
     name='justirc',
-    version='1.0.0',
+    version='1.0.1',
     description='Secure End-to-End Encrypted IRC Client and Server',
     long_description=long_description,
     long_description_content_type='text/markdown',

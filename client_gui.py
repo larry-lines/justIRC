@@ -42,6 +42,8 @@ class IRCClientGUI:
         self.users = {}  # All users: user_id -> {nickname, public_key}
         self.channel_users = {}  # Users in current channel: channel -> set(user_ids)
         self.channel_operators = {}  # Channel operators: channel -> set(operator_user_ids)
+        self.channel_mods = {}  # Channel mods: channel -> set(mod_user_ids)
+        self.channel_owners = {}  # Channel owners: channel -> owner_user_id
         self.protected_channels = set()  # Channels that are password-protected
         self.current_channel: Optional[str] = None
         self.current_recipient: Optional[str] = None  # For private messages
@@ -62,11 +64,20 @@ class IRCClientGUI:
         """Set window icon from PNG file"""
         try:
             import os
+            import sys
+            
+            # Get base path - different for frozen (PyInstaller) vs development
+            if getattr(sys, 'frozen', False):
+                # Running from PyInstaller bundle
+                base_path = sys._MEIPASS
+            else:
+                # Running in development
+                base_path = os.path.dirname(os.path.abspath(__file__))
             
             # Try multiple paths to find the logo
             possible_paths = [
+                os.path.join(base_path, "JUSTIRC-logo.png"),  # Bundled location
                 "JUSTIRC-logo.png",  # Current directory
-                os.path.join(os.path.dirname(os.path.abspath(__file__)), "JUSTIRC-logo.png"),  # Script directory
                 os.path.join(os.getcwd(), "JUSTIRC-logo.png")  # Working directory
             ]
             
@@ -616,11 +627,21 @@ class IRCClientGUI:
 🔹 Actions & Formatting:
   /me action                 - Send action (*user does something*)
   
-🔹 Channel Management (operators only):
-  /op user                   - Grant operator status (no password needed)
-  /mod user                  - Same as /op (grant moderator)
-  /kick user [reason]        - Kick user from channel
-  /topic new topic           - Set channel topic
+🔹 Channel Management:
+  Mods - Can kick users
+  Operators - Can kick, ban, give mod status
+  Owners - All operator powers + give operator status + transfer ownership
+  
+  /op user                   - Grant operator (owner only, requires setting op password)
+  /unop user                 - Remove operator status (owner only)
+  /mod user                  - Grant mod status (operators+)
+  /unmod user                - Remove mod status (operators+)
+  /kick user [reason]        - Kick user from channel (mods+)
+  /ban user [reason]         - Ban user from channel (operators+)
+  /unban user                - Unban user from channel (operators+)
+  /kickban user [reason]     - Kick and ban user (operators+)
+  /transfer user             - Transfer channel ownership (owner only, target must be op)
+  /topic new topic           - Set channel topic (operators+)
   
 🔹 Information:
   /users                     - List all online users
@@ -634,6 +655,7 @@ class IRCClientGUI:
 💡 Tip: Right-click a channel user for quick actions
 💡 Tip: Press Tab to autocomplete nicknames
 💡 Tip: Channel messages are filtered - switch channels to see different conversations
+💡 Tip: Operators need a password - set it when granted op, provide it when rejoining
 """
         
         dialog = tk.Toplevel(self.root)
@@ -727,7 +749,7 @@ class IRCClientGUI:
         info_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=10)
         
         info_text = (
-            "Version 1.0\n\n"
+            "Version 1.0.1\n\n"
             "🔐 End-to-End Encrypted IRC Client\n\n"
             "Features:\n"
             "  • X25519 ECDH key exchange\n"
@@ -854,14 +876,14 @@ class IRCClientGUI:
         self.op_user_dialog_for_user(nickname)
     
     def op_user_dialog_for_user(self, target_nickname):
-        """Show op dialog for specific user"""
+        """Show op dialog for specific user - requires operator password"""
         if not self.connected or not self.current_channel:
             return
         
-        # Create simplified confirmation dialog (no password needed for verified operators)
+        # Create dialog to get operator password for the new operator
         dialog = tk.Toplevel(self.root)
         dialog.title("Grant Operator")
-        dialog.geometry("350x120")
+        dialog.geometry("400x180")
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -869,20 +891,89 @@ class IRCClientGUI:
         colors = self.config.get_theme_colors()
         dialog.config(bg=colors['bg'])
         
-        ttk.Label(dialog, text=f"Grant operator status to {target_nickname}?", font=('Arial', 10, 'bold')).pack(pady=20)
+        ttk.Label(dialog, text=f"Grant operator status to {target_nickname}", font=('Arial', 10, 'bold')).pack(pady=15)
+        
+        ttk.Label(dialog, text="Set operator password for user (4+ chars):").pack(anchor=tk.W, padx=20)
+        password_entry = ttk.Entry(dialog, width=40, show='*')
+        password_entry.pack(padx=20, fill=tk.X, pady=5)
+        password_entry.focus()
         
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(pady=15)
         
         def grant():
+            password = password_entry.get().strip()
+            if len(password) < 4:
+                messagebox.showerror("Error", "Operator password must be at least 4 characters")
+                return
             dialog.destroy()
             asyncio.run_coroutine_threadsafe(
-                self._op_user(target_nickname, ""),  # No password needed
+                self._op_user(target_nickname, password),
                 self.loop
             )
         
         ttk.Button(btn_frame, text="Grant", command=grant, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=dialog.destroy, width=10).pack(side=tk.LEFT)
+        
+        # Bind enter key
+        password_entry.bind('<Return>', lambda e: grant())
+    
+    def _prompt_op_password(self, channel: str, is_new: bool):
+        """Prompt user for operator password"""
+        # Create dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Operator Password Required")
+        dialog.geometry("400x180")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Apply theme colors
+        colors = self.config.get_theme_colors()
+        dialog.config(bg=colors['bg'])
+        
+        if is_new:
+            prompt_text = f"Set your operator password for {channel} (4+ chars):"
+        else:
+            prompt_text = f"Enter your operator password for {channel}:"
+        
+        ttk.Label(dialog, text=prompt_text, font=('Arial', 10, 'bold')).pack(pady=15)
+        
+        password_entry = ttk.Entry(dialog, width=40, show='*')
+        password_entry.pack(padx=20, fill=tk.X, pady=5)
+        password_entry.focus()
+        
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=15)
+        
+        def submit():
+            password = password_entry.get().strip()
+            if not password:
+                messagebox.showerror("Error", "Password cannot be empty")
+                return
+            if is_new and len(password) < 4:
+                messagebox.showerror("Error", "Password must be at least 4 characters")
+                return
+            dialog.destroy()
+            # Send password response to server
+            msg = Protocol.build_message(
+                MessageType.OP_PASSWORD_RESPONSE,
+                channel=channel,
+                password=password
+            )
+            asyncio.run_coroutine_threadsafe(
+                self.send_to_server(msg),
+                self.loop
+            )
+        
+        def cancel():
+            dialog.destroy()
+            # User refused to provide password - will be disconnected by server
+            self.log("Operator authentication cancelled - you will be disconnected", "error")
+        
+        ttk.Button(btn_frame, text="Submit", command=submit, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=cancel, width=10).pack(side=tk.LEFT)
+        
+        password_entry.bind('<Return>', lambda e: submit())
     
     def kick_user_dialog(self, target_nickname):
         """Show kick user dialog"""
@@ -1066,7 +1157,8 @@ class IRCClientGUI:
         except asyncio.TimeoutError:
             self.root.after(0, lambda: self.log(f"Connection timeout: Server unavailable after 10 seconds", "error"))
         except Exception as e:
-            self.root.after(0, lambda: self.log(f"Connection lost: {e}", "error"))
+            error_msg = str(e)
+            self.root.after(0, lambda: self.log(f"Connection lost: {error_msg}", "error"))
         finally:
             self.connected = False
             if self.writer:
@@ -1108,9 +1200,11 @@ class IRCClientGUI:
                 if channel not in self.channel_users:
                     self.channel_users[channel] = set()
                 
-                # Initialize channel operators set
+                # Initialize channel operators and mods sets
                 if channel not in self.channel_operators:
                     self.channel_operators[channel] = set()
+                if channel not in self.channel_mods:
+                    self.channel_mods[channel] = set()
                 
                 # Load member keys and track them
                 members = message.get('members', [])
@@ -1121,6 +1215,14 @@ class IRCClientGUI:
                     # Track operator status
                     if member.get('is_operator', False):
                         self.channel_operators[channel].add(member_id)
+                    
+                    # Track mod status
+                    if member.get('is_mod', False):
+                        self.channel_mods[channel].add(member_id)
+                    
+                    # Track owner
+                    if member.get('is_owner', False):
+                        self.channel_owners[channel] = member_id
                     
                     if member_id != self.user_id:
                         self.users[member_id] = {
@@ -1170,7 +1272,8 @@ class IRCClientGUI:
                 else:
                     self.root.after(0, lambda: self.log_chat(sender, plaintext, channel="PM", msg_type="msg"))
             except Exception as e:
-                self.root.after(0, lambda: self.log(f"Failed to decrypt PM: {e}", "error"))
+                error_msg = str(e)
+                self.root.after(0, lambda: self.log(f"Failed to decrypt PM: {error_msg}", "error"))
         
         elif msg_type == MessageType.CHANNEL_MESSAGE.value:
             from_id = message.get('from_id')
@@ -1209,11 +1312,28 @@ class IRCClientGUI:
             nickname = message['nickname']
             channel = message['channel']
             public_key = message.get('public_key')
+            is_operator = message.get('is_operator', False)
+            is_mod = message.get('is_mod', False)
+            is_owner = message.get('is_owner', False)
             
             # Add user to channel tracking
             if channel not in self.channel_users:
                 self.channel_users[channel] = set()
             self.channel_users[channel].add(user_id)
+            
+            # Initialize channel role tracking if needed
+            if channel not in self.channel_operators:
+                self.channel_operators[channel] = set()
+            if channel not in self.channel_mods:
+                self.channel_mods[channel] = set()
+            
+            # Track their roles
+            if is_operator:
+                self.channel_operators[channel].add(user_id)
+            if is_mod:
+                self.channel_mods[channel].add(user_id)
+            if is_owner:
+                self.channel_owners[channel] = user_id
             
             if user_id != self.user_id:
                 self.users[user_id] = {'nickname': nickname, 'public_key': public_key}
@@ -1242,6 +1362,25 @@ class IRCClientGUI:
             if self.current_channel == channel:
                 self.root.after(0, self._update_channel_user_list)
         
+        elif msg_type == MessageType.DISCONNECT.value:
+            user_id = message.get('user_id')
+            nickname = message.get('nickname')
+            
+            # Remove user from global user list
+            if user_id and user_id in self.users:
+                del self.users[user_id]
+            
+            # Remove from all channel tracking
+            for channel in self.channel_users.values():
+                channel.discard(user_id)
+            
+            # Update both user lists
+            self.root.after(0, self._update_user_list)
+            if self.current_channel:
+                self.root.after(0, self._update_channel_user_list)
+            
+            self.root.after(0, lambda n=nickname: self.log(f"{n} disconnected", "system"))
+        
         elif msg_type == MessageType.IMAGE_START.value:
             await self.handle_image_start(message)
         
@@ -1268,6 +1407,135 @@ class IRCClientGUI:
                 self.root.after(0, lambda: self.log(list_text, "info"))
             else:
                 self.root.after(0, lambda: self.log("No channels available", "info"))
+        
+        elif msg_type == MessageType.OP_USER.value:
+            # Someone was granted operator status
+            channel = message.get('channel')
+            user_id = message.get('user_id')
+            nickname = message.get('nickname')
+            granted_by = message.get('granted_by')
+            
+            if channel in self.channel_operators:
+                self.channel_operators[channel].add(user_id)
+            else:
+                self.channel_operators[channel] = {user_id}
+            
+            self.root.after(0, lambda: self.log(f"{nickname} was granted operator status by {granted_by} in {channel}", "system"))
+            if self.current_channel == channel:
+                self.root.after(0, self._update_channel_user_list)
+        
+        elif msg_type == MessageType.UNOP_USER.value:
+            # Someone had operator status removed
+            channel = message.get('channel')
+            user_id = message.get('user_id')
+            nickname = message.get('nickname')
+            removed_by = message.get('removed_by')
+            
+            if channel in self.channel_operators:
+                self.channel_operators[channel].discard(user_id)
+            
+            self.root.after(0, lambda: self.log(f"{nickname} had operator status removed by {removed_by} in {channel}", "system"))
+            if self.current_channel == channel:
+                self.root.after(0, self._update_channel_user_list)
+        
+        elif msg_type == MessageType.MOD_USER.value:
+            # Someone was granted mod status
+            channel = message.get('channel')
+            user_id = message.get('user_id')
+            nickname = message.get('nickname')
+            granted_by = message.get('granted_by')
+            
+            if channel in self.channel_mods:
+                self.channel_mods[channel].add(user_id)
+            else:
+                self.channel_mods[channel] = {user_id}
+            
+            self.root.after(0, lambda: self.log(f"{nickname} was granted mod status by {granted_by} in {channel}", "system"))
+            if self.current_channel == channel:
+                self.root.after(0, self._update_channel_user_list)
+        
+        elif msg_type == MessageType.UNMOD_USER.value:
+            # Someone had mod status removed
+            channel = message.get('channel')
+            user_id = message.get('user_id')
+            nickname = message.get('nickname')
+            removed_by = message.get('removed_by')
+            
+            if channel in self.channel_mods:
+                self.channel_mods[channel].discard(user_id)
+            
+            self.root.after(0, lambda: self.log(f"{nickname} had mod status removed by {removed_by} in {channel}", "system"))
+            if self.current_channel == channel:
+                self.root.after(0, self._update_channel_user_list)
+        
+        elif msg_type == MessageType.KICK_USER.value:
+            # You were kicked from a channel
+            channel = message.get('channel')
+            kicked_by = message.get('kicked_by')
+            reason = message.get('reason', 'No reason given')
+            
+            # Remove from joined channels
+            if channel in self.joined_channels:
+                self.joined_channels.remove(channel)
+            
+            # Clear channel data
+            if channel in self.channel_users:
+                del self.channel_users[channel]
+            if channel in self.channel_operators:
+                del self.channel_operators[channel]
+            if channel in self.channel_mods:
+                del self.channel_mods[channel]
+            
+            # If viewing this channel, clear it
+            if self.current_channel == channel:
+                self.current_channel = None
+                self.root.after(0, self.update_context_label)
+            
+            self.root.after(0, lambda: self.log(f"You were kicked from {channel} by {kicked_by}: {reason}", "error"))
+            self.root.after(0, self._update_channel_list)
+        
+        elif msg_type == MessageType.BAN_USER.value:
+            # You were banned from a channel
+            channel = message.get('channel')
+            banned_by = message.get('banned_by')
+            reason = message.get('reason', 'No reason given')
+            
+            # Remove from joined channels
+            if channel in self.joined_channels:
+                self.joined_channels.remove(channel)
+            
+            # Clear channel data
+            if channel in self.channel_users:
+                del self.channel_users[channel]
+            if channel in self.channel_operators:
+                del self.channel_operators[channel]
+            if channel in self.channel_mods:
+                del self.channel_mods[channel]
+            
+            # If viewing this channel, clear it
+            if self.current_channel == channel:
+                self.current_channel = None
+                self.root.after(0, self.update_context_label)
+            
+            self.root.after(0, lambda: self.log(f"You were BANNED from {channel} by {banned_by}: {reason}", "error"))
+            self.root.after(0, self._update_channel_list)
+        
+        elif msg_type == MessageType.UNBAN_USER.value:
+            # You were unbanned from a channel
+            channel = message.get('channel')
+            unbanned_by = message.get('unbanned_by')
+            
+            self.root.after(0, lambda: self.log(f"You were unbanned from {channel} by {unbanned_by}", "success"))
+        
+        elif msg_type == MessageType.OP_PASSWORD_REQUEST.value:
+            channel = message.get('channel')
+            action = message.get('action')
+            
+            # Request password from user
+            if action == 'set':
+                self.root.after(0, lambda: self._prompt_op_password(channel, is_new=True))
+            else:  # verify
+                self.root.after(0, lambda: self._prompt_op_password(channel, is_new=False))
         
         elif msg_type == MessageType.ERROR.value:
             error = message.get('error')
@@ -1297,22 +1565,27 @@ class IRCClientGUI:
         # Get users in current channel
         channel_members = self.channel_users.get(self.current_channel, set())
         channel_ops = self.channel_operators.get(self.current_channel, set())
+        channel_mods = self.channel_mods.get(self.current_channel, set())
+        channel_owner = self.channel_owners.get(self.current_channel)
         
-        # Sort: operators first, then alphabetically
+        # Sort: owner first, then operators, then mods, then alphabetically
         members_with_info = []
         for user_id in channel_members:
             info = self.users.get(user_id)
             if info:
                 nickname = info['nickname']
+                is_owner = (user_id == channel_owner)
                 is_op = user_id in channel_ops
-                members_with_info.append((nickname, user_id, is_op))
+                is_mod = user_id in channel_mods
+                # Sort key: (not owner, not op, not mod, nickname)
+                members_with_info.append((nickname, user_id, is_owner, is_op, is_mod))
         
-        # Sort: ops first, then alphabetically by nickname
-        members_with_info.sort(key=lambda x: (not x[2], x[0].lower()))
+        # Sort: owner first, then ops, then mods, then alphabetically by nickname
+        members_with_info.sort(key=lambda x: (not x[2], not x[3], not x[4], x[0].lower()))
         
         # Add to listbox with symbols
-        for i, (nickname, user_id, is_op) in enumerate(members_with_info):
-            symbol = self.config.get_role_symbol(is_op)
+        for i, (nickname, user_id, is_owner, is_op, is_mod) in enumerate(members_with_info):
+            symbol = self.config.get_role_symbol(is_owner=is_owner, is_op=is_op, is_mod=is_mod)
             display_name = f"{symbol} {nickname}"
             
             self.channel_user_list.insert(tk.END, display_name)
@@ -1431,8 +1704,21 @@ class IRCClientGUI:
                     await self.send_to_server(msg)
                     self.root.after(0, lambda: self.log(f"[PM to {self.current_recipient}] {action_text}", "action"))
         
-        elif cmd in ['/mod', '/op']:
-            # Grant operator (same as /op)
+        elif cmd == '/op':
+            # Grant operator status (requires password)
+            if not self.current_channel:
+                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
+                return
+            if not args:
+                self.root.after(0, lambda: self.log("Usage: /op <user>", "error"))
+                return
+            
+            target_nickname = args.strip()
+            # Will need password - show dialog
+            self.root.after(0, lambda: self.op_user_dialog_for_user(target_nickname))
+        
+        elif cmd == '/mod':
+            # Grant mod status (no password needed)
             if not self.current_channel:
                 self.root.after(0, lambda: self.log("You must be in a channel", "error"))
                 return
@@ -1441,8 +1727,11 @@ class IRCClientGUI:
                 return
             
             target_nickname = args.strip()
-            # Will need password - show dialog
-            self.root.after(0, lambda: self.op_user_dialog_for_user(target_nickname))
+            msg = Protocol.build_message(MessageType.MOD_USER, channel=self.current_channel, target_nickname=target_nickname)
+            asyncio.run_coroutine_threadsafe(
+                self.send_to_server(msg),
+                self.loop
+            )
         
         elif cmd == '/join':
             if not args:
@@ -1521,6 +1810,76 @@ class IRCClientGUI:
                 return
             topic = args.strip()
             msg = Protocol.set_topic(self.current_channel, topic)
+            await self.send_to_server(msg)
+        
+        elif cmd == '/unop':
+            if not self.current_channel:
+                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
+                return
+            if not args:
+                self.root.after(0, lambda: self.log("Usage: /unop <user>", "error"))
+                return
+            target_nickname = args.strip()
+            msg = Protocol.build_message(MessageType.UNOP_USER, channel=self.current_channel, target_nickname=target_nickname)
+            await self.send_to_server(msg)
+        
+        elif cmd == '/unmod':
+            if not self.current_channel:
+                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
+                return
+            if not args:
+                self.root.after(0, lambda: self.log("Usage: /unmod <user>", "error"))
+                return
+            target_nickname = args.strip()
+            msg = Protocol.build_message(MessageType.UNMOD_USER, channel=self.current_channel, target_nickname=target_nickname)
+            await self.send_to_server(msg)
+        
+        elif cmd == '/ban':
+            if not self.current_channel:
+                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
+                return
+            parts = args.split(maxsplit=1)
+            if not parts:
+                self.root.after(0, lambda: self.log("Usage: /ban <user> [reason]", "error"))
+                return
+            target_nickname = parts[0]
+            reason = parts[1] if len(parts) > 1 else "No reason given"
+            msg = Protocol.build_message(MessageType.BAN_USER, channel=self.current_channel, target_nickname=target_nickname, reason=reason)
+            await self.send_to_server(msg)
+        
+        elif cmd == '/kickban':
+            if not self.current_channel:
+                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
+                return
+            parts = args.split(maxsplit=1)
+            if not parts:
+                self.root.after(0, lambda: self.log("Usage: /kickban <user> [reason]", "error"))
+                return
+            target_nickname = parts[0]
+            reason = parts[1] if len(parts) > 1 else "No reason given"
+            msg = Protocol.build_message(MessageType.KICKBAN_USER, channel=self.current_channel, target_nickname=target_nickname, reason=reason)
+            await self.send_to_server(msg)
+        
+        elif cmd == '/unban':
+            if not self.current_channel:
+                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
+                return
+            if not args:
+                self.root.after(0, lambda: self.log("Usage: /unban <user>", "error"))
+                return
+            target_nickname = args.strip()
+            msg = Protocol.build_message(MessageType.UNBAN_USER, channel=self.current_channel, target_nickname=target_nickname)
+            await self.send_to_server(msg)
+        
+        elif cmd == '/transfer':
+            if not self.current_channel:
+                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
+                return
+            if not args:
+                self.root.after(0, lambda: self.log("Usage: /transfer <operator_nickname>", "error"))
+                return
+            target_nickname = args.strip()
+            msg = Protocol.build_message(MessageType.TRANSFER_OWNERSHIP, channel=self.current_channel, target_nickname=target_nickname)
             await self.send_to_server(msg)
         
         elif cmd == '/quit':
@@ -1652,7 +2011,8 @@ class IRCClientGUI:
             # Echo own message
             self.root.after(0, lambda: self.log_chat(f"To {target_nickname}", text, channel="PM", msg_type="msg"))
         except Exception as e:
-            self.root.after(0, lambda: self.log(f"Failed to send PM: {e}", "error"))
+            error_msg = str(e)
+            self.root.after(0, lambda: self.log(f"Failed to send PM: {error_msg}", "error"))
     
     def join_channel_dialog(self):
         """Show join channel dialog"""
@@ -1840,7 +2200,8 @@ class IRCClientGUI:
             self.root.after(0, lambda: self.log(f"Image sent: {filename}", "success"))
         
         except Exception as e:
-            self.root.after(0, lambda: self.log(f"Failed to send image: {e}", "error"))
+            error_msg = str(e)
+            self.root.after(0, lambda: self.log(f"Failed to send image: {error_msg}", "error"))
     
     async def handle_image_start(self, message: dict):
         """Handle start of image transfer - prompt user to accept"""
@@ -1874,7 +2235,8 @@ class IRCClientGUI:
             self.root.after(0, lambda: self._prompt_image_accept(image_id, sender, filename, size_mb))
         
         except Exception as e:
-            self.root.after(0, lambda: self.log(f"Failed to process image request: {e}", "error"))
+            error_msg = str(e)
+            self.root.after(0, lambda: self.log(f"Failed to process image request: {error_msg}", "error"))
     
     async def handle_image_chunk(self, message: dict):
         """Handle image chunk - only process if accepted"""
@@ -1946,7 +2308,8 @@ class IRCClientGUI:
                 sender = pending['sender']
                 self.root.after(0, lambda: self.log(f"Image saved: {filename} (from {sender})", "success"))
             except Exception as e:
-                self.root.after(0, lambda: self.log(f"Failed to save image: {e}", "error"))
+                error_msg = str(e)
+                self.root.after(0, lambda: self.log(f"Failed to save image: {error_msg}", "error"))
             
             # Clean up
             del self.pending_images[image_id]
