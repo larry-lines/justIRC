@@ -205,6 +205,15 @@ Create private channels that require a password to join.
 ❌ Who is talking to whom (metadata visible to server)  
 ❌ Message timing and sizes (traffic analysis possible)
 
+### Key Rotation (Perfect Forward Secrecy):
+
+🔐 **Automatic Rotation**: Keys automatically rotate after:
+- 1 hour of continuous use (configurable)
+- 10,000 messages exchanged (configurable)
+- Ensures past messages remain secure even if current keys are compromised
+
+🔐 **Manual Rotation**: Use `/rekey <username>` to immediately rotate encryption keys with a specific user for enhanced security
+
 ### Best Practices:
 
 1. **Verify recipients** before sending sensitive data
@@ -212,6 +221,74 @@ Create private channels that require a password to join.
 3. **Use Tor/VPN** for IP anonymity (see TOR_SETUP.md)
 4. **Delete received images** after viewing if sensitive
 5. **Don't reuse passwords** from other services
+6. **Rotate keys regularly** for sensitive conversations using `/rekey`
+
+---
+
+## Server Hardening
+
+JustIRC includes comprehensive server hardening features for production deployments:
+
+### Input Validation
+
+🛡️ **Comprehensive Validation**: All user inputs are validated and sanitized:
+- Nicknames: 3-20 alphanumeric characters (plus _ and -)
+- Channel names: Must start with #, 1-50 characters
+- Messages: Maximum 4KB, no control characters
+- Passwords: 8-256 characters
+- Reserved names blocked (server, admin, root, system)
+
+### IP Filtering
+
+🚫 **Blacklist/Whitelist**: Control access at the network level:
+- Blacklist: Block specific IPs or network ranges (CIDR notation)
+- Whitelist: Only allow specific IPs or networks (optional mode)
+- Temporary bans: Automatic expiry after configurable duration
+- Persistent storage: Lists survive server restarts
+
+**Configuration** (`server_config.json`):
+```json
+{
+  "enable_ip_whitelist": false
+}
+```
+
+**Files** (auto-created):
+- `server_data/ip_blacklist.json`: Blacklisted IPs/networks
+- `server_data/ip_whitelist.json`: Whitelisted IPs/networks
+
+### Connection Limits
+
+⏱️ **Timeouts and Limits**: Prevent resource exhaustion:
+- Connection timeout: 300 seconds (5 minutes) default
+- Read timeout: 60 seconds (1 minute) per message
+- Max message size: 64KB default
+- Rate limiting: 30 messages/10s, 5 connections/min per IP
+
+**Configuration** (`server_config.json`):
+```json
+{
+  "connection_timeout": 300,
+  "read_timeout": 60,
+  "max_message_size": 65536
+}
+```
+
+### Authentication Security
+
+🔐 **Account Protection**:
+- PBKDF2-HMAC-SHA256 password hashing (100,000 iterations)
+- Automatic account lockout after 5 failed attempts (15-minute window)
+- Session token management for persistent authentication
+- Optional account requirement for server access
+
+**Configuration** (`server_config.json`):
+```json
+{
+  "enable_authentication": false,
+  "require_authentication": false
+}
+```
 
 ---
 

@@ -9,8 +9,12 @@ import argparse
 import json
 import hashlib
 import os
-from typing import Dict, Set
+from typing import Dict, Set, Optional
 from protocol import Protocol, MessageType
+from rate_limiter import RateLimiter, ConnectionRateLimiter
+from auth_manager import AuthenticationManager
+from input_validator import InputValidator
+from ip_filter import IPFilter
 
 
 # Configure logging
@@ -63,6 +67,37 @@ class IRCServer:
         self.server_name = self.config.get('server_name', 'JustIRC Server')
         self.description = self.config.get('description', 'Welcome to JustIRC!')
         
+        # Authentication settings
+        enable_auth = self.config.get('enable_authentication', False)
+        require_auth = self.config.get('require_authentication', False)
+        accounts_file = os.path.join(data_dir, 'accounts.json')
+        
+        # Initialize authentication manager
+        self.auth_manager = AuthenticationManager(
+            accounts_file=accounts_file,
+            enable_accounts=enable_auth,
+            require_authentication=require_auth
+        )
+        
+        # Track authenticated sessions
+        self.authenticated_users: Dict[str, str] = {}  # user_id -> username
+        
+        # IP filtering
+        enable_whitelist = self.config.get('enable_ip_whitelist', False)
+        blacklist_file = os.path.join(data_dir, 'ip_blacklist.json')
+        whitelist_file = os.path.join(data_dir, 'ip_whitelist.json')
+        
+        self.ip_filter = IPFilter(
+            blacklist_file=blacklist_file,
+            whitelist_file=whitelist_file,
+            enable_whitelist=enable_whitelist
+        )
+        
+        # Connection timeout settings
+        self.connection_timeout = self.config.get('connection_timeout', 300)  # 5 minutes
+        self.read_timeout = self.config.get('read_timeout', 60)  # 1 minute
+        self.max_message_size = self.config.get('max_message_size', 65536)  # 64KB
+        
         # Ensure data directory exists
         os.makedirs(data_dir, exist_ok=True)
         
@@ -78,6 +113,18 @@ class IRCServer:
         self.channel_topics: Dict[str, str] = {}  # channel -> topic string
         self.nicknames: Dict[str, str] = {}  # nickname -> user_id
         self.pending_op_auth: Dict[str, tuple] = {}  # user_id -> (channel, should_be_op)
+        
+        # Rate limiting
+        # Messages: 30 per 10 seconds per client
+        self.message_limiter = RateLimiter(max_requests=30, time_window=10.0)
+        # Image chunks: 100 per 10 seconds per client  
+        self.image_limiter = RateLimiter(max_requests=100, time_window=10.0)
+        # Connections: 5 per minute per IP, ban after 10 violations
+        self.connection_limiter = ConnectionRateLimiter(
+            max_connections=5, 
+            time_window=60.0, 
+            ban_threshold=10
+        )
         
         # Load persistent channel data
         self.load_channels()
@@ -176,14 +223,61 @@ class IRCServer:
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle a new client connection"""
         client = Client(reader, writer)
+        
+        # Extract IP address for rate limiting and filtering
+        peername = writer.get_extra_info('peername')
+        ip_address = peername[0] if peername else "unknown"
+        
+        # Check IP filter first
+        if not self.ip_filter.is_allowed(ip_address):
+            logger.warning(f"Connection from {ip_address} blocked by IP filter")
+            try:
+                error_msg = Protocol.error("Access denied")
+                writer.write(error_msg.encode('utf-8') + b'\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+            except:
+                pass
+            return
+        
+        # Check connection rate limit
+        allowed, reason = self.connection_limiter.is_allowed(ip_address)
+        if not allowed:
+            logger.warning(f"Connection from {ip_address} rate limited: {reason}")
+            try:
+                error_msg = Protocol.error(reason)
+                writer.write(error_msg.encode('utf-8') + b'\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+            except:
+                pass
+            return
+        
         logger.info(f"New connection from {client.address}")
         
         try:
             while True:
-                # Read message (newline delimited)
-                data = await reader.readline()
+                # Read message with timeout
+                try:
+                    data = await asyncio.wait_for(
+                        reader.readline(),
+                        timeout=self.read_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"Read timeout for {client.nickname or client.address}")
+                    await client.send(Protocol.error("Read timeout"))
+                    break
+                
                 if not data:
                     break
+                
+                # Check message size
+                if len(data) > self.max_message_size:
+                    logger.warning(f"Message too large from {client.nickname or client.address}")
+                    await client.send(Protocol.error("Message too large"))
+                    continue
                 
                 message_str = data.decode('utf-8').strip()
                 if not message_str:
@@ -210,8 +304,23 @@ class IRCServer:
         if msg_type == MessageType.REGISTER.value:
             await self.handle_register(client, message)
         
+        elif msg_type == MessageType.AUTH_REQUEST.value:
+            await self.handle_auth_request(client, message)
+        
+        elif msg_type == MessageType.CREATE_ACCOUNT.value:
+            await self.handle_create_account(client, message)
+        
+        elif msg_type == MessageType.CHANGE_PASSWORD.value:
+            await self.handle_change_password(client, message)
+        
         elif msg_type == MessageType.PUBLIC_KEY_REQUEST.value:
             await self.handle_public_key_request(client, message)
+        
+        elif msg_type == MessageType.REKEY_REQUEST.value:
+            await self.handle_rekey_request(client, message)
+        
+        elif msg_type == MessageType.REKEY_RESPONSE.value:
+            await self.handle_rekey_response(client, message)
         
         elif msg_type == MessageType.PRIVATE_MESSAGE.value:
             await self.route_private_message(client, message)
@@ -279,10 +388,42 @@ class IRCServer:
         """Register a new client"""
         nickname = message.get('nickname')
         public_key = message.get('public_key')
+        password = message.get('password')
+        session_token = message.get('session_token')
         
         if not nickname or not public_key:
             await client.send(Protocol.error("Missing nickname or public_key"))
             return
+        
+        # Validate nickname
+        is_valid, error_msg = InputValidator.validate_nickname(nickname)
+        if not is_valid:
+            await client.send(Protocol.error(error_msg))
+            return
+        
+        # Check authentication requirements
+        if self.auth_manager.require_authentication:
+            # Verify session token or password
+            authenticated_username = None
+            
+            if session_token:
+                authenticated_username = self.auth_manager.verify_session(session_token)
+            elif password and self.auth_manager.account_exists(nickname):
+                # Try to authenticate
+                token = self.auth_manager.authenticate(nickname, password)
+                if token:
+                    authenticated_username = nickname
+            
+            if not authenticated_username:
+                await client.send(Protocol.auth_required(
+                    "Authentication required. Please login or create an account."
+                ))
+                return
+            
+            # Check if account is disabled
+            if self.auth_manager.is_account_disabled(authenticated_username):
+                await client.send(Protocol.error("Account is disabled"))
+                return
         
         # Check if nickname is taken
         if nickname in self.nicknames:
@@ -299,6 +440,12 @@ class IRCServer:
         
         self.clients[user_id] = client
         self.nicknames[nickname] = user_id
+        
+        # Track authentication
+        if self.auth_manager.enable_accounts and password:
+            username = self.auth_manager.verify_session(session_token) if session_token else nickname
+            if username:
+                self.authenticated_users[user_id] = username
         
         logger.info(f"Registered {nickname} with ID {user_id}")
         
@@ -317,6 +464,123 @@ class IRCServer:
         
         # Broadcast to all other users that a new user joined
         await self.broadcast_new_user(client)
+    
+    async def handle_auth_request(self, client: Client, message: dict):
+        """Handle authentication request"""
+        username = message.get('username')
+        password = message.get('password')
+        
+        if not username or not password:
+            await client.send(Protocol.auth_response(
+                success=False,
+                message="Missing username or password"
+            ))
+            return
+        
+        # Authenticate
+        session_token = self.auth_manager.authenticate(username, password)
+        
+        if session_token:
+            await client.send(Protocol.auth_response(
+                success=True,
+                session_token=session_token,
+                message=f"Authenticated as {username}"
+            ))
+            logger.info(f"User {username} authenticated successfully")
+        else:
+            # Check if account is locked
+            if self.auth_manager.is_account_locked(username):
+                await client.send(Protocol.auth_response(
+                    success=False,
+                    message="Account temporarily locked due to failed login attempts"
+                ))
+            else:
+                await client.send(Protocol.auth_response(
+                    success=False,
+                    message="Invalid username or password"
+                ))
+            logger.warning(f"Failed authentication attempt for {username}")
+    
+    async def handle_create_account(self, client: Client, message: dict):
+        """Handle account creation request"""
+        if not self.auth_manager.enable_accounts:
+            await client.send(Protocol.error("Account creation is disabled"))
+            return
+        
+        username = message.get('username')
+        password = message.get('password')
+        email = message.get('email')
+        
+        if not username or not password:
+            await client.send(Protocol.error("Missing username or password"))
+            return
+        
+        # Validate username (alphanumeric, 3-20 chars)
+        if not username.isalnum() or len(username) < 3 or len(username) > 20:
+            await client.send(Protocol.error(
+                "Username must be 3-20 alphanumeric characters"
+            ))
+            return
+        
+        # Validate password length
+        if len(password) < 8:
+            await client.send(Protocol.error(
+                "Password must be at least 8 characters"
+            ))
+            return
+        
+        # Create account
+        if self.auth_manager.create_account(username, password, email):
+            # Automatically authenticate the new user
+            session_token = self.auth_manager.authenticate(username, password)
+            
+            await client.send(Protocol.build_message(
+                MessageType.ACK,
+                success=True,
+                session_token=session_token,
+                message=f"Account created for {username}"
+            ))
+            logger.info(f"New account created: {username}")
+        else:
+            await client.send(Protocol.error(
+                f"Username {username} is already taken"
+            ))
+    
+    async def handle_change_password(self, client: Client, message: dict):
+        """Handle password change request"""
+        if not self.auth_manager.enable_accounts:
+            await client.send(Protocol.error("Authentication is disabled"))
+            return
+        
+        if not client.user_id or client.user_id not in self.authenticated_users:
+            await client.send(Protocol.error("You must be authenticated"))
+            return
+        
+        old_password = message.get('old_password')
+        new_password = message.get('new_password')
+        
+        if not old_password or not new_password:
+            await client.send(Protocol.error("Missing old_password or new_password"))
+            return
+        
+        # Validate new password length
+        if len(new_password) < 8:
+            await client.send(Protocol.error(
+                "New password must be at least 8 characters"
+            ))
+            return
+        
+        username = self.authenticated_users[client.user_id]
+        
+        if self.auth_manager.change_password(username, old_password, new_password):
+            await client.send(Protocol.build_message(
+                MessageType.ACK,
+                success=True,
+                message="Password changed successfully"
+            ))
+            logger.info(f"Password changed for user {username}")
+        else:
+            await client.send(Protocol.error("Invalid old password"))
     
     async def handle_public_key_request(self, client: Client, message: dict):
         """Send a peer's public key"""
@@ -337,8 +601,65 @@ class IRCServer:
         )
         await client.send(response)
     
+    async def handle_rekey_request(self, client: Client, message: dict):
+        """Handle key rotation request"""
+        to_id = message.get('to_id')
+        new_public_key = message.get('new_public_key')
+        
+        if not to_id or not new_public_key:
+            await client.send(Protocol.error("Missing to_id or new_public_key"))
+            return
+        
+        if to_id not in self.clients:
+            await client.send(Protocol.error(f"User {to_id} not found"))
+            return
+        
+        # Forward the rekey request to the target user
+        target = self.clients[to_id]
+        rekey_msg = Protocol.build_message(
+            MessageType.REKEY_REQUEST,
+            from_id=client.user_id,
+            from_nickname=client.nickname,
+            new_public_key=new_public_key
+        )
+        await target.send(rekey_msg)
+        logger.info(f"Key rotation request from {client.nickname} to {target.nickname}")
+    
+    async def handle_rekey_response(self, client: Client, message: dict):
+        """Handle key rotation response"""
+        to_id = message.get('to_id')
+        new_public_key = message.get('new_public_key')
+        
+        if not to_id or not new_public_key:
+            await client.send(Protocol.error("Missing to_id or new_public_key"))
+            return
+        
+        if to_id not in self.clients:
+            await client.send(Protocol.error(f"User {to_id} not found"))
+            return
+        
+        # Forward the rekey response to the original requester
+        target = self.clients[to_id]
+        rekey_msg = Protocol.build_message(
+            MessageType.REKEY_RESPONSE,
+            from_id=client.user_id,
+            from_nickname=client.nickname,
+            new_public_key=new_public_key
+        )
+        await target.send(rekey_msg)
+        logger.info(f"Key rotation response from {client.nickname} to {target.nickname}")
+    
     async def route_private_message(self, client: Client, message: dict):
         """Route encrypted private message (server cannot decrypt)"""
+        # Check rate limit
+        if not self.message_limiter.is_allowed(client.user_id):
+            retry_after = self.message_limiter.get_retry_after(client.user_id)
+            await client.send(Protocol.error(
+                f"Rate limit exceeded. Retry after {retry_after:.1f} seconds"
+            ))
+            logger.warning(f"Rate limited message from {client.nickname}")
+            return
+        
         to_id = message.get('to_id')
         
         if to_id not in self.clients:
@@ -353,6 +674,15 @@ class IRCServer:
     
     async def route_channel_message(self, client: Client, message: dict):
         """Route encrypted channel message to all members"""
+        # Check rate limit
+        if not self.message_limiter.is_allowed(client.user_id):
+            retry_after = self.message_limiter.get_retry_after(client.user_id)
+            await client.send(Protocol.error(
+                f"Rate limit exceeded. Retry after {retry_after:.1f} seconds"
+            ))
+            logger.warning(f"Rate limited channel message from {client.nickname}")
+            return
+        
         channel = message.get('to_id')
         
         if channel not in self.channels:
@@ -378,6 +708,12 @@ class IRCServer:
         
         if not channel:
             await client.send(Protocol.error("Missing channel name"))
+            return
+        
+        # Validate channel name
+        is_valid, error_msg = InputValidator.validate_channel_name(channel)
+        if not is_valid:
+            await client.send(Protocol.error(error_msg))
             return
         
         # Normalize channel name: lowercase and replace spaces with hyphens
@@ -651,6 +987,17 @@ class IRCServer:
     
     async def route_image_message(self, client: Client, message: dict):
         """Route encrypted image messages"""
+        # Rate limit image chunks
+        msg_type = message.get('type')
+        if msg_type == MessageType.IMAGE_CHUNK.value:
+            if not self.image_limiter.is_allowed(client.user_id):
+                retry_after = self.image_limiter.get_retry_after(client.user_id)
+                await client.send(Protocol.error(
+                    f"Image transfer rate limit exceeded. Retry after {retry_after:.1f} seconds"
+                ))
+                logger.warning(f"Rate limited image chunk from {client.nickname}")
+                return
+        
         to_id = message.get('to_id')
         
         if to_id not in self.clients:

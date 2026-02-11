@@ -7,6 +7,7 @@ Uses X25519 for key exchange and ChaCha20-Poly1305 for encryption
 import os
 import base64
 import json
+import time
 from typing import Tuple, Dict, Optional
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
 from cryptography.hazmat.primitives import serialization, hashes
@@ -17,8 +18,14 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 class CryptoLayer:
     """Handles all cryptographic operations"""
     
-    def __init__(self):
-        """Initialize crypto layer with new key pair"""
+    def __init__(self, key_rotation_interval: float = 3600.0, max_messages_per_key: int = 10000):
+        """
+        Initialize crypto layer with new key pair
+        
+        Args:
+            key_rotation_interval: Time in seconds before key rotation is recommended
+            max_messages_per_key: Max messages before key rotation is forced
+        """
         # Generate long-term identity key pair
         self.private_key = X25519PrivateKey.generate()
         self.public_key = self.private_key.public_key()
@@ -28,6 +35,12 @@ class CryptoLayer:
         
         # Store public keys of peers
         self.peer_public_keys: Dict[str, X25519PublicKey] = {}
+        
+        # Key rotation tracking
+        self.key_rotation_interval = key_rotation_interval
+        self.max_messages_per_key = max_messages_per_key
+        self.peer_key_timestamp: Dict[str, float] = {}  # peer_id -> timestamp
+        self.peer_message_count: Dict[str, int] = {}  # peer_id -> message count
     
     def get_public_key_bytes(self) -> bytes:
         """Get public key as bytes"""
@@ -46,6 +59,10 @@ class CryptoLayer:
             public_key_bytes = base64.b64decode(public_key_b64)
             peer_public_key = X25519PublicKey.from_public_bytes(public_key_bytes)
             self.peer_public_keys[peer_id] = peer_public_key
+            
+            # Initialize rotation tracking
+            self.peer_key_timestamp[peer_id] = time.time()
+            self.peer_message_count[peer_id] = 0
             
             # Immediately compute shared secret
             self._compute_shared_secret(peer_id)
@@ -77,6 +94,10 @@ class CryptoLayer:
         Encrypt data for a specific peer
         Returns: (encrypted_data_b64, nonce_b64)
         """
+        # Increment message count for potential rotation
+        if peer_id in self.peer_message_count:
+            self.peer_message_count[peer_id] += 1
+        
         if peer_id not in self.shared_secrets:
             raise ValueError(f"No shared secret with {peer_id}. Exchange keys first.")
         
@@ -152,12 +173,117 @@ class CryptoLayer:
         """Check if we have a peer's public key"""
         return peer_id in self.peer_public_keys
     
+    def should_rotate_key(self, peer_id: str) -> bool:
+        """
+        Check if key rotation is needed for a peer
+        
+        Args:
+            peer_id: Peer to check
+            
+        Returns:
+            True if key should be rotated
+        """
+        if peer_id not in self.peer_key_timestamp:
+            return False
+        
+        # Check time-based rotation
+        time_elapsed = time.time() - self.peer_key_timestamp[peer_id]
+        if time_elapsed >= self.key_rotation_interval:
+            return True
+        
+        # Check message-count-based rotation
+        if peer_id in self.peer_message_count:
+            if self.peer_message_count[peer_id] >= self.max_messages_per_key:
+                return True
+        
+        return False
+    
+    def get_rotation_reason(self, peer_id: str) -> Optional[str]:
+        """
+        Get human-readable reason for key rotation
+        
+        Args:
+            peer_id: Peer to check
+            
+        Returns:
+            Reason string or None if no rotation needed
+        """
+        if not self.should_rotate_key(peer_id):
+            return None
+        
+        if peer_id not in self.peer_key_timestamp:
+            return None
+        
+        time_elapsed = time.time() - self.peer_key_timestamp[peer_id]
+        if time_elapsed >= self.key_rotation_interval:
+            return f"Time limit reached ({time_elapsed/60:.1f} minutes)"
+        
+        if peer_id in self.peer_message_count:
+            if self.peer_message_count[peer_id] >= self.max_messages_per_key:
+                return f"Message limit reached ({self.peer_message_count[peer_id]} messages)"
+        
+        return "Unknown reason"
+    
+    def rotate_key_for_peer(self, peer_id: str):
+        """
+        Rotate encryption key for a peer (reinitialize with new ephemeral key)
+        This maintains the same public key exchange but derives a new shared secret
+        
+        Args:
+            peer_id: Peer to rotate key for
+        """
+        if peer_id not in self.peer_public_keys:
+            raise ValueError(f"No public key for {peer_id}")
+        
+        # Recompute shared secret (in practice, would generate new ephemeral key)
+        # For simplicity, we'll regenerate the entire key pair
+        self.private_key = X25519PrivateKey.generate()
+        self.public_key = self.private_key.public_key()
+        
+        # Recompute all shared secrets with new key
+        for pid in list(self.peer_public_keys.keys()):
+            self._compute_shared_secret(pid)
+            self.peer_key_timestamp[pid] = time.time()
+            self.peer_message_count[pid] = 0
+    
+    def get_key_stats(self, peer_id: str) -> Dict[str, any]:
+        """
+        Get statistics about a peer's key
+        
+        Args:
+            peer_id: Peer to get stats for
+            
+        Returns:
+            Dictionary with key statistics
+        """
+        if peer_id not in self.peer_key_timestamp:
+            return {}
+        
+        time_elapsed = time.time() - self.peer_key_timestamp[peer_id]
+        message_count = self.peer_message_count.get(peer_id, 0)
+        
+        return {
+            "peer_id": peer_id,
+            "key_age_seconds": time_elapsed,
+            "key_age_minutes": time_elapsed / 60,
+            "message_count": message_count,
+            "should_rotate": self.should_rotate_key(peer_id),
+            "rotation_reason": self.get_rotation_reason(peer_id),
+            "time_until_rotation": max(0, self.key_rotation_interval - time_elapsed),
+            "messages_until_rotation": max(0, self.max_messages_per_key - message_count)
+        }
+    
     def remove_peer(self, peer_id: str):
         """Remove peer's keys and secrets (for perfect forward secrecy)"""
         if peer_id in self.shared_secrets:
             del self.shared_secrets[peer_id]
         if peer_id in self.peer_public_keys:
             del self.peer_public_keys[peer_id]
+        # Also clean up rotation tracking
+        if peer_id in self.peer_key_timestamp:
+            del self.peer_key_timestamp[peer_id]
+        if peer_id in self.peer_message_count:
+            del self.peer_message_count[peer_id]
 
 
 class ChannelCrypto:

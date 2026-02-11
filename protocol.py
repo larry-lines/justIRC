@@ -15,10 +15,19 @@ class MessageType(Enum):
     REGISTER = "register"
     DISCONNECT = "disconnect"
     
+    # Authentication
+    AUTH_REQUIRED = "auth_required"
+    AUTH_REQUEST = "auth_request"
+    AUTH_RESPONSE = "auth_response"
+    CREATE_ACCOUNT = "create_account"
+    CHANGE_PASSWORD = "change_password"
+    
     # Key exchange
     KEY_EXCHANGE = "key_exchange"
     PUBLIC_KEY_REQUEST = "public_key_request"
     PUBLIC_KEY_RESPONSE = "public_key_response"
+    REKEY_REQUEST = "rekey_request"
+    REKEY_RESPONSE = "rekey_response"
     
     # Messaging
     PRIVATE_MESSAGE = "private_message"
@@ -86,12 +95,71 @@ class Protocol:
             raise ValueError(f"Invalid JSON message: {e}")
     
     @staticmethod
-    def register(nickname: str, public_key: str) -> str:
+    def register(nickname: str, public_key: str, password: Optional[str] = None, 
+                session_token: Optional[str] = None) -> str:
         """Create a registration message"""
+        msg_data = {
+            "nickname": nickname,
+            "public_key": public_key
+        }
+        if password:
+            msg_data["password"] = password
+        if session_token:
+            msg_data["session_token"] = session_token
+        
+        return Protocol.build_message(MessageType.REGISTER, **msg_data)
+    
+    @staticmethod
+    def auth_required(message: str = "Authentication required") -> str:
+        """Create an auth required message"""
         return Protocol.build_message(
-            MessageType.REGISTER,
-            nickname=nickname,
-            public_key=public_key
+            MessageType.AUTH_REQUIRED,
+            message=message
+        )
+    
+    @staticmethod
+    def auth_request(username: str, password: str) -> str:
+        """Create an authentication request"""
+        return Protocol.build_message(
+            MessageType.AUTH_REQUEST,
+            username=username,
+            password=password
+        )
+    
+    @staticmethod
+    def auth_response(success: bool, session_token: Optional[str] = None,
+                     message: Optional[str] = None) -> str:
+        """Create an authentication response"""  
+        msg_data = {
+            "success": success
+        }
+        if session_token:
+            msg_data["session_token"] = session_token
+        if message:
+            msg_data["message"] = message
+        
+        return Protocol.build_message(MessageType.AUTH_RESPONSE, **msg_data)
+    
+    @staticmethod
+    def create_account(username: str, password: str, 
+                      email: Optional[str] = None) -> str:
+        """Create an account creation request"""
+        msg_data = {
+            "username": username,
+            "password": password
+        }
+        if email:
+            msg_data["email"] = email
+        
+        return Protocol.build_message(MessageType.CREATE_ACCOUNT, **msg_data)
+    
+    @staticmethod
+    def change_password(old_password: str, new_password: str) -> str:
+        """Create a password change request"""
+        return Protocol.build_message(
+            MessageType.CHANGE_PASSWORD,
+            old_password=old_password,
+            new_password=new_password
         )
     
     @staticmethod
@@ -102,6 +170,26 @@ class Protocol:
             from_id=from_id,
             to_id=to_id,
             public_key=public_key
+        )
+    
+    @staticmethod
+    def rekey_request(from_id: str, to_id: str, new_public_key: str) -> str:
+        """Create a rekey request message"""
+        return Protocol.build_message(
+            MessageType.REKEY_REQUEST,
+            from_id=from_id,
+            to_id=to_id,
+            new_public_key=new_public_key
+        )
+    
+    @staticmethod
+    def rekey_response(from_id: str, to_id: str, new_public_key: str) -> str:
+        """Create a rekey response message"""
+        return Protocol.build_message(
+            MessageType.REKEY_RESPONSE,
+            from_id=from_id,
+            to_id=to_id,
+            new_public_key=new_public_key
         )
     
     @staticmethod

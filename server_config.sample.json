@@ -1,8 +1,14 @@
 {
   "server_name": "JustIRC Server",
-  "description": "Welcome to JustIRC - Secure End-to-End Encrypted IRC\n\n🔒 Features:\n  • X25519 ECDH key exchange\n  • ChaCha20-Poly1305 encryption\n  • Zero-knowledge routing server\n  • Persistent channels with operator system\n  • Encrypted image transfer\n\n📖 Quick Start:\n  /join #channel password - Join or create a channel\n  /help - Show available commands\n  /list - List all channels\n\nThe server cannot decrypt your messages - they are end-to-end encrypted!",
+  "description": "Welcome to JustIRC - Secure End-to-End Encrypted IRC\n\n🔒 Features:\n  • X25519 ECDH key exchange\n  • ChaCha20-Poly1305 encryption\n  • Zero-knowledge routing server\n  • Persistent channels with operator system\n  • Encrypted image transfer\n  • Optional user authentication\n\n📖 Quick Start:\n  /join #channel password - Join or create a channel\n  /help - Show available commands\n  /list - List all channels\n\nThe server cannot decrypt your messages - they are end-to-end encrypted!",
   "max_channels": 1000,
   "max_users": 10000,
   "host": "0.0.0.0",
-  "port": 6667
+  "port": 6667,
+  "enable_authentication": false,
+  "require_authentication": false,
+  "enable_ip_whitelist": false,
+  "connection_timeout": 300,
+  "read_timeout": 60,
+  "max_message_size": 65536
 }

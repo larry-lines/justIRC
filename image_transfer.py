@@ -15,6 +15,13 @@ class ImageTransfer:
         self.crypto = crypto
         self.receiving_images = {}  # image_id -> {chunks, metadata}
     
+    def chunk_image(self, image_data: bytes) -> list:
+        """Split image data into chunks"""
+        chunks = []
+        for i in range(0, len(image_data), self.CHUNK_SIZE):
+            chunks.append(image_data[i:i + self.CHUNK_SIZE])
+        return chunks if chunks else [b""]  # Return empty chunk if no data
+    
     def prepare_image(self, image_path: str) -> tuple:
         """Read and prepare image for encrypted transfer"""
         with open(image_path, 'rb') as f:
