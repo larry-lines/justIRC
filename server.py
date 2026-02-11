@@ -173,6 +173,9 @@ class IRCServer:
                 for channel, banned_list in banned_data.items():
                     self.channel_banned[channel] = set(banned_list)
                 
+                # Load channel topics
+                self.channel_topics = data.get('channel_topics', {})
+                
                 # Initialize empty operator and mod sets for existing channels
                 for channel in self.channel_passwords.keys():
                     self.channel_operators[channel] = set()
@@ -198,7 +201,8 @@ class IRCServer:
                 'channel_creator_passwords': self.channel_creator_passwords,
                 'operator_passwords': self.operator_passwords,
                 'channel_owners': self.channel_owners,
-                'channel_banned': banned_data
+                'channel_banned': banned_data,
+                'channel_topics': self.channel_topics
             }
             with open(self.channels_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -874,7 +878,8 @@ class IRCServer:
             members=members,
             is_protected=channel in self.channel_passwords,
             is_operator=is_operator,
-            is_owner=is_owner
+            is_owner=is_owner,
+            topic=self.channel_topics.get(channel, "")
         )
         await client.send(response)
         

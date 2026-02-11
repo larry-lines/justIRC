@@ -346,9 +346,9 @@ We welcome community input! If you have ideas for features or improvements:
 
 ## 📅 Release Schedule
 
-- **v1.1.0** - Q2 2026 (Testing, Security, Documentation)
-- **v1.2.0** - Q4 2026 (Features, Performance, UX)
-- **v2.0.0** - Q2 2027 (Federation, P2P, Advanced Features)
+- **v1.1.0** - Q1 2026 (Testing, Security, Documentation)
+- **v1.2.0** - Q2 2026 (Features, Performance, UX)
+- **v2.0.0** - Q4 2026 (Federation, P2P, Advanced Features)
 
 **Note:** This roadmap is a living document and priorities may shift based on community needs, security requirements, and resource availability.
 

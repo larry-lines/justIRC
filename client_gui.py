@@ -1340,6 +1340,11 @@ class IRCClientGUI:
                 self.root.after(0, self._update_channel_user_list)
                 self.root.after(0, self.update_context_label)
                 self.root.after(0, lambda: self.log(f"Joined {channel} ({len(members)} members)", "success"))
+                
+                # Display topic if set
+                topic = message.get('topic', '')
+                if topic:
+                    self.root.after(0, lambda t=topic: self.log(f"Topic: {t}", "info"))
         
         elif msg_type == MessageType.USER_LIST.value:
             users = message.get('users', [])
@@ -1597,6 +1602,19 @@ class IRCClientGUI:
             
             self.root.after(0, lambda: self.log(f"You were kicked from {channel} by {kicked_by}: {reason}", "error"))
             self.root.after(0, self._update_channel_list)
+        
+        elif msg_type == MessageType.SET_TOPIC.value:
+            # Topic was changed
+            channel = message.get('channel')
+            topic = message.get('topic', '')
+            set_by = message.get('set_by', 'someone')
+            
+            if topic:
+                self.root.after(0, lambda c=channel, t=topic, s=set_by: 
+                              self.log(f"[{c}] Topic changed by {s}: {t}", "info"))
+            else:
+                self.root.after(0, lambda c=channel, s=set_by:
+                              self.log(f"[{c}] Topic cleared by {s}", "info"))
         
         elif msg_type == MessageType.BAN_USER.value:
             # You were banned from a channel
