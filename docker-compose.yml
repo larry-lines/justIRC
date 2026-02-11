@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  irc-server:
+    build: .
+    container_name: justirc-server
+    ports:
+      - "6667:6667"
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+    networks:
+      - irc-network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  irc-network:
+    driver: bridge

@@ -1,0 +1,11 @@
+# Core cryptography
+cryptography>=42.0.0
+
+# Image handling (for image transfer feature)
+Pillow>=10.0.0
+
+# CLI interface (for colored terminal output)
+colorama>=0.4.6
+
+# Note: asyncio is built into Python 3.7+
+# Note: tkinter is built into Python (for GUI client)

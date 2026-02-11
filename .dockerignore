@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+
+# Documentation (not needed in container)
+*.md
+docs/
+
+# Client files (server only)
+client.py
+client_gui.py
+test_suite.py
+
+# Images and test data
+*.png
+*.jpg
+*.jpeg
+*.gif
+received_*
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# GCP
+deploy_gcp.sh
+gcp_startup_script.sh
+.gcp/
+
+# Misc
+*.log
+.DS_Store
