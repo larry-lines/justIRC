@@ -1,4 +1,55 @@
-# JustIRC Release Notes - v1.0.0
+# JustIRC Release Notes
+
+## v1.0.1 - Bug Fix Release
+
+**Date:** 11 February 2026
+
+This is a maintenance release that fixes critical bugs discovered in v1.0.0.
+
+### 🐛 Bug Fixes
+
+#### Client Stability
+- **Fixed NameError in Exception Handlers:** Resolved issue where lambda functions in error handlers tried to capture exception variables after they went out of scope. This caused crashes when displaying error messages for:
+  - Connection failures
+  - PM decryption errors
+  - PM sending failures
+  - Image transfer errors
+
+#### Server Stability
+- **Fixed Syntax Error in Operator Authentication:** Corrected improper escape sequences in operator password request handlers that prevented the server from starting.
+
+#### New Features
+- **Unban Command:** Added `/unban` command to allow operators to remove users from channel ban lists.
+  - Operator+ permission required
+  - Notifies unbanned user and channel members
+  - Persists changes to disk
+
+### 📦 Installation
+
+#### Windows
+Download and run the executable for your preferred interface from the `dist/` directory:
+- `JustIRC-GUI.exe` - Graphical client (15 MB)
+- `JustIRC-CLI.exe` - Command-line client (12 MB)
+- `JustIRC-Server.exe` - Server executable (8.2 MB)
+
+#### Linux
+Standalone executables available in `dist/` directory:
+- `JustIRC-GUI` - Graphical client (18 MB)
+- `JustIRC-CLI` - Command-line client (14 MB)
+- `JustIRC-Server` - Server executable (9.2 MB)
+
+Or install via pip:
+```bash
+pip install .
+```
+
+### 🔄 Upgrading from v1.0.0
+
+Simply replace your existing executables with the new ones. All data files and configurations remain compatible.
+
+---
+
+## v1.0.0 - Initial Release
 
 **Date:** 11 February 2026
 
