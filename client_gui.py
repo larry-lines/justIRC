@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Optional
 from protocol import Protocol, MessageType
 from crypto_layer import CryptoLayer
-from client import ImageTransfer
+from image_transfer import ImageTransfer
 from config_manager import ConfigManager
 
 

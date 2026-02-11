@@ -47,7 +47,7 @@ pyinstaller --name "JustIRC-GUI" ^
     --icon=JUSTIRC-logo.png ^
     --add-data "JUSTIRC-logo.png;." ^
     --add-data "README.md;." ^
-    --add-data "THEMES.md;." ^
+    --add-data "docs\THEMES.md;." ^
     client_gui.py
 
 if errorlevel 1 (

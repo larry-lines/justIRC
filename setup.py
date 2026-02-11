@@ -8,12 +8,18 @@ from setuptools import setup, find_packages
 import os
 
 # Read README for long description
-with open('README.md', 'r', encoding='utf-8') as f:
-    long_description = f.read()
+try:
+    with open('README.md', 'r', encoding='utf-8') as f:
+        long_description = f.read()
+except FileNotFoundError:
+    long_description = "JustIRC - Secure End-to-End Encrypted IRC Client and Server"
 
 # Read requirements
-with open('requirements.txt', 'r', encoding='utf-8') as f:
-    requirements = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+try:
+    with open('requirements.txt', 'r', encoding='utf-8') as f:
+        requirements = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+except FileNotFoundError:
+    requirements = []
 
 setup(
     name='justirc',
@@ -23,7 +29,7 @@ setup(
     long_description_content_type='text/markdown',
     author='JustIRC Team',
     author_email='',
-    url='https://github.com/yourusername/justIRC',
+    url='https://github.com/larry-lines/justIRC',
     license='MIT',
     
     # Package data
