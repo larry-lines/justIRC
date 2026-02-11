@@ -55,6 +55,10 @@ class MessageType(Enum):
     WHOIS_RESPONSE = "whois_response"
     CHANNEL_LIST_RESPONSE = "channel_list_response"
     
+    # User status
+    SET_STATUS = "set_status"
+    STATUS_UPDATE = "status_update"
+    
     # File transfer
     IMAGE_START = "image_start"
     IMAGE_CHUNK = "image_chunk"
@@ -344,4 +348,13 @@ class Protocol:
             MessageType.SET_TOPIC,
             channel=channel,
             topic=topic
+        )
+    
+    @staticmethod
+    def set_status(status: str, custom_message: str = "") -> str:
+        """Create a set status message"""
+        return Protocol.build_message(
+            MessageType.SET_STATUS,
+            status=status,
+            custom_message=custom_message
         )
