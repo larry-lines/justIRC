@@ -198,9 +198,16 @@ class ConfigManager:
         hash_val = int(hashlib.sha256(nickname.encode()).hexdigest(), 16)
         return colors[hash_val % len(colors)]
 
-    def get_role_symbol(self, is_op: bool) -> str:
+    def get_role_symbol(self, is_owner: bool = False, is_op: bool = False, is_mod: bool = False) -> str:
         """Get symbol for user role"""
-        return "👑" if is_op else "👤"
+        if is_owner:
+            return "👑"  # Crown for owner
+        elif is_op:
+            return "⭐"  # Star for operator
+        elif is_mod:
+            return "🛡️"  # Shield for mod
+        else:
+            return "👤"  # Person for regular user
 
     def get_theme_colors(self):
         """Get colors for current theme"""

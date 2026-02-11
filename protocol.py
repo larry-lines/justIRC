@@ -28,8 +28,17 @@ class MessageType(Enum):
     JOIN_CHANNEL = "join_channel"
     LEAVE_CHANNEL = "leave_channel"
     OP_USER = "op_user"
+    UNOP_USER = "unop_user"
+    MOD_USER = "mod_user"
+    UNMOD_USER = "unmod_user"
     KICK_USER = "kick_user"
+    BAN_USER = "ban_user"
+    UNBAN_USER = "unban_user"
+    KICKBAN_USER = "kickban_user"
     SET_TOPIC = "set_topic"
+    TRANSFER_OWNERSHIP = "transfer_ownership"
+    OP_PASSWORD_REQUEST = "op_password_request"
+    OP_PASSWORD_RESPONSE = "op_password_response"
     
     # Information requests
     WHOIS = "whois"
@@ -212,7 +221,7 @@ class Protocol:
             MessageType.OP_USER,
             channel=channel,
             target_nickname=target_nickname,
-            password=password
+            op_password=password
         )
     
     @staticmethod

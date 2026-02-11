@@ -70,9 +70,14 @@ class IRCServer:
         self.channels: Dict[str, Set[str]] = {}  # channel -> set of user_ids
         self.channel_passwords: Dict[str, str] = {}  # channel -> hashed password
         self.channel_operators: Dict[str, Set[str]] = {}  # channel -> set of operator user_ids
+        self.channel_mods: Dict[str, Set[str]] = {}  # channel -> set of mod user_ids
+        self.channel_owners: Dict[str, str] = {}  # channel -> owner user_id
         self.channel_creator_passwords: Dict[str, str] = {}  # channel -> hashed creator password
+        self.operator_passwords: Dict[str, Dict[str, str]] = {}  # channel -> {user_id -> hashed_password}
+        self.channel_banned: Dict[str, Set[str]] = {}  # channel -> set of banned user_ids
         self.channel_topics: Dict[str, str] = {}  # channel -> topic string
         self.nicknames: Dict[str, str] = {}  # nickname -> user_id
+        self.pending_op_auth: Dict[str, tuple] = {}  # user_id -> (channel, should_be_op)
         
         # Load persistent channel data
         self.load_channels()
@@ -109,9 +114,22 @@ class IRCServer:
                 # Load channel creator passwords (already hashed)
                 self.channel_creator_passwords = data.get('channel_creator_passwords', {})
                 
-                # Initialize empty operator sets for existing channels
+                # Load operator passwords (already hashed)
+                self.operator_passwords = data.get('operator_passwords', {})
+                
+                # Load channel owners
+                self.channel_owners = data.get('channel_owners', {})
+                
+                # Load banned users
+                # Convert lists back to sets
+                banned_data = data.get('channel_banned', {})
+                for channel, banned_list in banned_data.items():
+                    self.channel_banned[channel] = set(banned_list)
+                
+                # Initialize empty operator and mod sets for existing channels
                 for channel in self.channel_passwords.keys():
                     self.channel_operators[channel] = set()
+                    self.channel_mods[channel] = set()
                     self.channels[channel] = set()
                 
                 logger.info(f"Loaded {len(self.channel_passwords)} persistent channels from {self.channels_file}")
@@ -123,9 +141,17 @@ class IRCServer:
     def save_channels(self):
         """Save persistent channel data to file"""
         try:
+            # Convert sets to lists for JSON serialization
+            banned_data = {}
+            for channel, banned_set in self.channel_banned.items():
+                banned_data[channel] = list(banned_set)
+            
             data = {
                 'channel_passwords': self.channel_passwords,
-                'channel_creator_passwords': self.channel_creator_passwords
+                'channel_creator_passwords': self.channel_creator_passwords,
+                'operator_passwords': self.operator_passwords,
+                'channel_owners': self.channel_owners,
+                'channel_banned': banned_data
             }
             with open(self.channels_file, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -201,6 +227,30 @@ class IRCServer:
         
         elif msg_type == MessageType.OP_USER.value:
             await self.handle_op_user(client, message)
+        
+        elif msg_type == MessageType.UNOP_USER.value:
+            await self.handle_unop_user(client, message)
+        
+        elif msg_type == MessageType.MOD_USER.value:
+            await self.handle_mod_user(client, message)
+        
+        elif msg_type == MessageType.UNMOD_USER.value:
+            await self.handle_unmod_user(client, message)
+        
+        elif msg_type == MessageType.OP_PASSWORD_RESPONSE.value:
+            await self.handle_op_password_response(client, message)
+        
+        elif msg_type == MessageType.BAN_USER.value:
+            await self.handle_ban_user(client, message)
+        
+        elif msg_type == MessageType.UNBAN_USER.value:
+            await self.handle_unban_user(client, message)
+        
+        elif msg_type == MessageType.KICKBAN_USER.value:
+            await self.handle_kickban_user(client, message)
+        
+        elif msg_type == MessageType.TRANSFER_OWNERSHIP.value:
+            await self.handle_transfer_ownership(client, message)
         
         elif msg_type == MessageType.WHOIS.value:
             await self.handle_whois(client, message)
@@ -324,7 +374,7 @@ class IRCServer:
         """Handle channel join request"""
         channel = message.get('channel')
         password = message.get('password')
-        creator_password = message.get('creator_password')  # For regaining operator status
+        creator_password = message.get('creator_password')  # For regaining owner/operator status
         
         if not channel:
             await client.send(Protocol.error("Missing channel name"))
@@ -333,11 +383,20 @@ class IRCServer:
         # Normalize channel name: lowercase and replace spaces with hyphens
         channel = channel.lower().replace(' ', '-')
         
+        # Check if user is banned from this channel
+        if channel in self.channel_banned and client.user_id in self.channel_banned[channel]:
+            await client.send(Protocol.error(f"You are banned from {channel}"))
+            return
+        
         # Check if this is a persistent channel (exists in storage)
         channel_exists = channel in self.channel_passwords or channel in self.channel_creator_passwords
         
         # Check if channel is currently active
         channel_active = channel in self.channels
+        
+        # Track if user should be operator (needs password)
+        should_be_operator = False
+        is_owner = False
         
         # Scenario 1: Brand new channel (not in persistent storage)
         if not channel_exists and not channel_active:
@@ -353,29 +412,43 @@ class IRCServer:
             # Create new persistent channel
             self.channels[channel] = set()
             self.channel_operators[channel] = set()
-            self.channel_operators[channel].add(client.user_id)
+            self.channel_mods[channel] = set()
+            self.channel_banned[channel] = set()
+            
+            # Set user as channel owner
+            self.channel_owners[channel] = client.user_id
+            is_owner = True
             
             # Save passwords (hashed)
             if password:
                 self.channel_passwords[channel] = self.hash_password(password)
             self.channel_creator_passwords[channel] = self.hash_password(creator_password)
             
+            # Owner needs to set operator password
+            should_be_operator = True
+            
             # Save to disk
             self.save_channels()
             
-            logger.info(f"Created new persistent channel {channel} with {client.nickname} as operator")
+            logger.info(f"Created new persistent channel {channel} with {client.nickname} as owner")
         
         # Scenario 2: Persistent channel exists (in storage) but not currently active
         elif channel_exists and not channel_active:
             # Re-initialize the channel
             self.channels[channel] = set()
             self.channel_operators[channel] = set()
+            self.channel_mods[channel] = set()
+            if channel not in self.channel_banned:
+                self.channel_banned[channel] = set()
             
-            # Check if user should regain operator status
+            # Check if user should regain operator/owner status
             if creator_password and channel in self.channel_creator_passwords:
                 if self.hash_password(creator_password) == self.channel_creator_passwords[channel]:
-                    self.channel_operators[channel].add(client.user_id)
-                    logger.info(f"{client.nickname} regained operator status in {channel}")
+                    should_be_operator = True
+                    # Check if they're the original owner
+                    if channel in self.channel_owners and self.channel_owners[channel] == client.user_id:
+                        is_owner = True
+                    logger.info(f"{client.nickname} regaining operator status in {channel}")
                 else:
                     await client.send(Protocol.error("Incorrect creator password"))
                     return
@@ -388,11 +461,14 @@ class IRCServer:
         
         # Scenario 3: Channel is currently active
         elif channel_active:
-            # Check if user should regain operator status
+            # Check if user should regain operator/owner status
             if creator_password and channel in self.channel_creator_passwords:
                 if self.hash_password(creator_password) == self.channel_creator_passwords[channel]:
-                    self.channel_operators[channel].add(client.user_id)
-                    logger.info(f"{client.nickname} regained operator status in {channel}")
+                    should_be_operator = True
+                    # Check if they're the original owner
+                    if channel in self.channel_owners and self.channel_owners[channel] == client.user_id:
+                        is_owner = True
+                    logger.info(f"{client.nickname} regaining operator status in {channel}")
             
             # Check join password if set
             if channel in self.channel_passwords:
@@ -404,7 +480,43 @@ class IRCServer:
         self.channels[channel].add(client.user_id)
         client.channels.add(channel)
         
-        logger.info(f"{client.nickname} joined {channel}")
+        # If user should be operator, request password verification
+        if should_be_operator:
+            # Check if they already have an operator password set
+            if channel in self.operator_passwords and client.user_id in self.operator_passwords[channel]:
+                # Ask for password
+                self.pending_op_auth[client.user_id] = (channel, True, is_owner)
+                request_msg = Protocol.build_message(
+                    MessageType.OP_PASSWORD_REQUEST,
+                    channel=channel,
+                    action="verify"
+                )
+                await client.send(request_msg)
+                logger.info(f"Requesting operator password from {client.nickname} for {channel}")
+                return  # Don't complete join yet
+            else:
+                # First time as operator - ask to set password
+                self.pending_op_auth[client.user_id] = (channel, True, is_owner)
+                request_msg = Protocol.build_message(
+                    MessageType.OP_PASSWORD_REQUEST,
+                    channel=channel,
+                    action="set"
+                )
+                await client.send(request_msg)
+                logger.info(f"Requesting new operator password from {client.nickname} for {channel}")
+                return  # Don't complete join yet
+        
+        # Complete the join process
+        await self.complete_join(client, channel, False, is_owner)
+    
+    async def complete_join(self, client: Client, channel: str, is_operator: bool, is_owner: bool):
+        """Complete the join process after authentication"""
+        # Grant operator status if needed
+        if is_operator:
+            self.channel_operators[channel].add(client.user_id)
+            logger.info(f"{client.nickname} joined {channel} as operator")
+        else:
+            logger.info(f"{client.nickname} joined {channel}")
         
         # Send acknowledgment with channel member list
         members = [
@@ -412,7 +524,9 @@ class IRCServer:
                 "user_id": uid,
                 "nickname": self.clients[uid].nickname,
                 "public_key": self.clients[uid].public_key,
-                "is_operator": uid in self.channel_operators.get(channel, set())
+                "is_operator": uid in self.channel_operators.get(channel, set()),
+                "is_mod": uid in self.channel_mods.get(channel, set()),
+                "is_owner": self.channel_owners.get(channel) == uid
             }
             for uid in self.channels[channel] if uid in self.clients
         ]
@@ -422,7 +536,9 @@ class IRCServer:
             success=True,
             channel=channel,
             members=members,
-            is_protected=channel in self.channel_passwords
+            is_protected=channel in self.channel_passwords,
+            is_operator=is_operator,
+            is_owner=is_owner
         )
         await client.send(response)
         
@@ -432,12 +548,64 @@ class IRCServer:
             user_id=client.user_id,
             nickname=client.nickname,
             channel=channel,
-            public_key=client.public_key
+            public_key=client.public_key,
+            is_operator=is_operator,
+            is_mod=client.user_id in self.channel_mods.get(channel, set()),
+            is_owner=is_owner
         )
         
         for user_id in self.channels[channel]:
             if user_id != client.user_id and user_id in self.clients:
                 await self.clients[user_id].send(join_notification)
+    
+    async def handle_op_password_response(self, client: Client, message: dict):
+        """Handle operator password response"""
+        password = message.get('password')
+        channel = message.get('channel')
+        
+        if not password:
+            await client.send(Protocol.error("Password required"))
+            # Disconnect user
+            await self.disconnect_client(client)
+            return
+        
+        # Check if we're expecting a response from this user
+        if client.user_id not in self.pending_op_auth:
+            await client.send(Protocol.error("Unexpected password response"))
+            return
+        
+        expected_channel, should_be_op, is_owner = self.pending_op_auth[client.user_id]
+        
+        if channel != expected_channel:
+            await client.send(Protocol.error("Channel mismatch"))
+            await self.disconnect_client(client)
+            return
+        
+        # Check if this is a new password (set) or verification
+        if channel not in self.operator_passwords:
+            self.operator_passwords[channel] = {}
+        
+        if client.user_id in self.operator_passwords[channel]:
+            # Verify existing password
+            if self.hash_password(password) != self.operator_passwords[channel][client.user_id]:
+                await client.send(Protocol.error("Incorrect operator password"))
+                await self.disconnect_client(client)
+                del self.pending_op_auth[client.user_id]
+                return
+        else:
+            # Set new password
+            if len(password) < 4:
+                await client.send(Protocol.error("Operator password must be at least 4 characters"))
+                await self.disconnect_client(client)
+                del self.pending_op_auth[client.user_id]
+                return
+            self.operator_passwords[channel][client.user_id] = self.hash_password(password)
+            self.save_channels()
+            logger.info(f"Set operator password for {client.nickname} in {channel}")
+        
+        # Authentication successful
+        del self.pending_op_auth[client.user_id]
+        await self.complete_join(client, channel, True, is_owner)
     
     async def handle_leave_channel(self, client: Client, message: dict):
         """Handle channel leave request"""
@@ -454,6 +622,10 @@ class IRCServer:
         # Remove from operators if they were one
         if channel in self.channel_operators:
             self.channel_operators[channel].discard(client.user_id)
+        
+        # Remove from mods if they were one
+        if channel in self.channel_mods:
+            self.channel_mods[channel].discard(client.user_id)
         
         # Channels are now persistent - don't delete when empty
         # if not self.channels[channel]:
@@ -492,12 +664,17 @@ class IRCServer:
         logger.debug(f"Routed encrypted image from {client.nickname} to {target.nickname}")
     
     async def handle_op_user(self, client: Client, message: dict):
-        """Handle granting operator status to a user"""
+        """Handle granting operator status to a user - Only owners can do this"""
         channel = message.get('channel')
         target_nickname = message.get('target_nickname')
+        op_password = message.get('op_password')
         
         if not channel or not target_nickname:
             await client.send(Protocol.error("Missing channel or target_nickname"))
+            return
+        
+        if not op_password or len(op_password) < 4:
+            await client.send(Protocol.error("Must provide an operator password (4+ chars) for the new operator"))
             return
         
         # Check if channel exists
@@ -510,9 +687,9 @@ class IRCServer:
             await client.send(Protocol.error(f"You are not in channel {channel}"))
             return
         
-        # Check if requester is an operator (this is the only authorization needed)
-        if client.user_id not in self.channel_operators.get(channel, set()):
-            await client.send(Protocol.error("You are not an operator in this channel"))
+        # Only channel owner can grant operator status
+        if self.channel_owners.get(channel) != client.user_id:
+            await client.send(Protocol.error("Only the channel owner can grant operator status"))
             return
         
         # Find target user
@@ -531,6 +708,12 @@ class IRCServer:
         if channel not in self.channel_operators:
             self.channel_operators[channel] = set()
         self.channel_operators[channel].add(target_id)
+        
+        # Set their operator password
+        if channel not in self.operator_passwords:
+            self.operator_passwords[channel] = {}
+        self.operator_passwords[channel][target_id] = self.hash_password(op_password)
+        self.save_channels()
         
         logger.info(f"{client.nickname} granted operator status to {target_nickname} in {channel}")
         
@@ -580,9 +763,13 @@ class IRCServer:
             await client.send(Protocol.error(f"You are not in channel {channel}"))
             return
         
-        # Check if requester is an operator
-        if client.user_id not in self.channel_operators.get(channel, set()):
-            await client.send(Protocol.error("You are not an operator in this channel"))
+        # Check if requester is a mod or operator (either can kick)
+        is_mod = client.user_id in self.channel_mods.get(channel, set())
+        is_op = client.user_id in self.channel_operators.get(channel, set())
+        is_owner = self.channel_owners.get(channel) == client.user_id
+        
+        if not (is_mod or is_op or is_owner):
+            await client.send(Protocol.error("You must be a mod or operator to kick users"))
             return
         
         # Find target user
@@ -602,6 +789,18 @@ class IRCServer:
             await client.send(Protocol.error("You cannot kick yourself"))
             return
         
+        # Check permissions - mods can't kick operators or owners, operators can kick anyone except owner
+        target_is_op = target_id in self.channel_operators.get(channel, set())
+        target_is_owner = self.channel_owners.get(channel) == target_id
+        
+        if target_is_owner:
+            await client.send(Protocol.error("Cannot kick the channel owner"))
+            return
+        
+        if is_mod and target_is_op:
+            await client.send(Protocol.error("Mods cannot kick operators"))
+            return
+        
         # Remove user from channel
         self.channels[channel].remove(target_id)
         if target_id in self.clients:
@@ -610,6 +809,10 @@ class IRCServer:
         # Remove operator status if they had it
         if channel in self.channel_operators and target_id in self.channel_operators[channel]:
             self.channel_operators[channel].remove(target_id)
+        
+        # Remove mod status if they had it
+        if channel in self.channel_mods and target_id in self.channel_mods[channel]:
+            self.channel_mods[channel].remove(target_id)
         
         logger.info(f"{client.nickname} kicked {target_nickname} from {channel}: {reason}")
         
@@ -636,6 +839,353 @@ class IRCServer:
         for user_id in self.channels[channel]:
             if user_id in self.clients and user_id != client.user_id:
                 await self.clients[user_id].send(kick_announcement)
+    
+    async def handle_unop_user(self, client: Client, message: dict):
+        """Handle removing operator status from a user"""
+        channel = message.get('channel')
+        target_nickname = message.get('target_nickname')
+        
+        if not channel or not target_nickname:
+            await client.send(Protocol.error("Missing channel or target_nickname"))
+            return
+        
+        # Only owner can remove operator status
+        if self.channel_owners.get(channel) != client.user_id:
+            await client.send(Protocol.error("Only the channel owner can remove operator status"))
+            return
+        
+        # Find target user
+        if target_nickname not in self.nicknames:
+            await client.send(Protocol.error(f"User {target_nickname} not found"))
+            return
+        
+        target_id = self.nicknames[target_nickname]
+        
+        # Remove operator status
+        if channel in self.channel_operators and target_id in self.channel_operators[channel]:
+            self.channel_operators[channel].remove(target_id)
+            # Also remove their operator password
+            if channel in self.operator_passwords and target_id in self.operator_passwords[channel]:
+                del self.operator_passwords[channel][target_id]
+                self.save_channels()
+            
+            logger.info(f"{client.nickname} removed operator status from {target_nickname} in {channel}")
+            await client.send(Protocol.ack(True, f"{target_nickname} is no longer an operator"))
+            
+            # Notify target
+            if target_id in self.clients:
+                await self.clients[target_id].send(Protocol.ack(True, f"You are no longer an operator in {channel}"))
+            
+            # Notify channel
+            notification = Protocol.build_message(
+                MessageType.UNOP_USER,
+                channel=channel,
+                user_id=target_id,
+                nickname=target_nickname,
+                removed_by=client.nickname
+            )
+            for user_id in self.channels[channel]:
+                if user_id in self.clients and user_id != client.user_id and user_id != target_id:
+                    await self.clients[user_id].send(notification)
+        else:
+            await client.send(Protocol.error(f"{target_nickname} is not an operator"))
+    
+    async def handle_mod_user(self, client: Client, message: dict):
+        """Handle granting mod status to a user"""
+        channel = message.get('channel')
+        target_nickname = message.get('target_nickname')
+        
+        if not channel or not target_nickname:
+            await client.send(Protocol.error("Missing channel or target_nickname"))
+            return
+        
+        # Check if channel exists
+        if channel not in self.channels:
+            await client.send(Protocol.error(f"Channel {channel} does not exist"))
+            return
+        
+        # Only operators and owners can grant mod status
+        is_op = client.user_id in self.channel_operators.get(channel, set())
+        is_owner = self.channel_owners.get(channel) == client.user_id
+        
+        if not (is_op or is_owner):
+            await client.send(Protocol.error("Only operators can grant mod status"))
+            return
+        
+        # Find target user
+        if target_nickname not in self.nicknames:
+            await client.send(Protocol.error(f"User {target_nickname} not found"))
+            return
+        
+        target_id = self.nicknames[target_nickname]
+        
+        # Check if target is in the channel
+        if target_id not in self.channels[channel]:
+            await client.send(Protocol.error(f"{target_nickname} is not in channel {channel}"))
+            return
+        
+        # Grant mod status
+        if channel not in self.channel_mods:
+            self.channel_mods[channel] = set()
+        self.channel_mods[channel].add(target_id)
+        
+        logger.info(f"{client.nickname} granted mod status to {target_nickname} in {channel}")
+        await client.send(Protocol.ack(True, f"{target_nickname} is now a mod in {channel}"))
+        
+        # Notify target
+        if target_id in self.clients:
+            await self.clients[target_id].send(Protocol.ack(True, f"You are now a mod in {channel}"))
+        
+        # Notify channel
+        notification = Protocol.build_message(
+            MessageType.MOD_USER,
+            channel=channel,
+            user_id=target_id,
+            nickname=target_nickname,
+            granted_by=client.nickname
+        )
+        for user_id in self.channels[channel]:
+            if user_id in self.clients and user_id != client.user_id and user_id != target_id:
+                await self.clients[user_id].send(notification)
+    
+    async def handle_unmod_user(self, client: Client, message: dict):
+        """Handle removing mod status from a user"""
+        channel = message.get('channel')
+        target_nickname = message.get('target_nickname')
+        
+        if not channel or not target_nickname:
+            await client.send(Protocol.error("Missing channel or target_nickname"))
+            return
+        
+        # Only operators and owners can remove mod status
+        is_op = client.user_id in self.channel_operators.get(channel, set())
+        is_owner = self.channel_owners.get(channel) == client.user_id
+        
+        if not (is_op or is_owner):
+            await client.send(Protocol.error("Only operators can remove mod status"))
+            return
+        
+        # Find target user
+        if target_nickname not in self.nicknames:
+            await client.send(Protocol.error(f"User {target_nickname} not found"))
+            return
+        
+        target_id = self.nicknames[target_nickname]
+        
+        # Remove mod status
+        if channel in self.channel_mods and target_id in self.channel_mods[channel]:
+            self.channel_mods[channel].remove(target_id)
+            logger.info(f"{client.nickname} removed mod status from {target_nickname} in {channel}")
+            await client.send(Protocol.ack(True, f"{target_nickname} is no longer a mod"))
+            
+            # Notify target
+            if target_id in self.clients:
+                await self.clients[target_id].send(Protocol.ack(True, f"You are no longer a mod in {channel}"))
+            
+            # Notify channel
+            notification = Protocol.build_message(
+                MessageType.UNMOD_USER,
+                channel=channel,
+                user_id=target_id,
+                nickname=target_nickname,
+                removed_by=client.nickname
+            )
+            for user_id in self.channels[channel]:
+                if user_id in self.clients and user_id != client.user_id and user_id != target_id:
+                    await self.clients[user_id].send(notification)
+        else:
+            await client.send(Protocol.error(f"{target_nickname} is not a mod"))
+    
+    async def handle_ban_user(self, client: Client, message: dict):
+        """Handle banning a user from a channel"""
+        channel = message.get('channel')
+        target_nickname = message.get('target_nickname')
+        reason = message.get('reason', 'No reason given')
+        
+        if not channel or not target_nickname:
+            await client.send(Protocol.error("Missing channel or target_nickname"))
+            return
+        
+        # Only operators and owners can ban
+        is_op = client.user_id in self.channel_operators.get(channel, set())
+        is_owner = self.channel_owners.get(channel) == client.user_id
+        
+        if not (is_op or is_owner):
+            await client.send(Protocol.error("Only operators can ban users"))
+            return
+        
+        # Find target user
+        if target_nickname not in self.nicknames:
+            await client.send(Protocol.error(f"User {target_nickname} not found"))
+            return
+        
+        target_id = self.nicknames[target_nickname]
+        
+        # Can't ban owner
+        if self.channel_owners.get(channel) == target_id:
+            await client.send(Protocol.error("Cannot ban the channel owner"))
+            return
+        
+        # Can't ban yourself
+        if target_id == client.user_id:
+            await client.send(Protocol.error("Cannot ban yourself"))
+            return
+        
+        # Add to ban list
+        if channel not in self.channel_banned:
+            self.channel_banned[channel] = set()
+        self.channel_banned[channel].add(target_id)
+        self.save_channels()
+        
+        logger.info(f"{client.nickname} banned {target_nickname} from {channel}: {reason}")
+        await client.send(Protocol.ack(True, f"{target_nickname} has been banned from {channel}"))
+        
+        # If user is in channel, kick them
+        if target_id in self.channels.get(channel, set()):
+            self.channels[channel].remove(target_id)
+            if target_id in self.clients:
+                self.clients[target_id].channels.discard(channel)
+            
+            # Remove operator/mod status
+            if channel in self.channel_operators:
+                self.channel_operators[channel].discard(target_id)
+            if channel in self.channel_mods:
+                self.channel_mods[channel].discard(target_id)
+            
+            # Notify banned user
+            if target_id in self.clients:
+                ban_msg = Protocol.build_message(
+                    MessageType.BAN_USER,
+                    channel=channel,
+                    banned_by=client.nickname,
+                    reason=reason
+                )
+                await self.clients[target_id].send(ban_msg)
+        
+        # Notify channel
+        announcement = Protocol.build_message(
+            MessageType.CHANNEL_MESSAGE,
+            channel=channel,
+            sender="SERVER",
+            text=f"{target_nickname} was banned by {client.nickname}: {reason}"
+        )
+        for user_id in self.channels.get(channel, set()):
+            if user_id in self.clients:
+                await self.clients[user_id].send(announcement)
+    
+    async def handle_kickban_user(self, client: Client, message: dict):
+        """Handle kicking and banning a user in one action"""
+        # Just call ban (which also kicks if needed)
+        await self.handle_ban_user(client, message)
+    
+    async def handle_unban_user(self, client: Client, message: dict):
+        """Handle unbanning a user from a channel"""
+        channel = message.get('channel')
+        target_nickname = message.get('target_nickname')
+        
+        if not channel or not target_nickname:
+            await client.send(Protocol.error("Missing channel or target_nickname"))
+            return
+        
+        # Only operators and owners can unban
+        is_op = client.user_id in self.channel_operators.get(channel, set())
+        is_owner = self.channel_owners.get(channel) == client.user_id
+        
+        if not (is_op or is_owner):
+            await client.send(Protocol.error("Only operators can unban users"))
+            return
+        
+        # Find target user
+        if target_nickname not in self.nicknames:
+            await client.send(Protocol.error(f"User {target_nickname} not found"))
+            return
+        
+        target_id = self.nicknames[target_nickname]
+        
+        # Check if user is actually banned
+        if channel not in self.channel_banned or target_id not in self.channel_banned[channel]:
+            await client.send(Protocol.error(f"{target_nickname} is not banned from {channel}"))
+            return
+        
+        # Remove from ban list
+        self.channel_banned[channel].discard(target_id)
+        self.save_channels()
+        
+        logger.info(f"{client.nickname} unbanned {target_nickname} from {channel}")
+        await client.send(Protocol.ack(True, f"{target_nickname} has been unbanned from {channel}"))
+        
+        # Notify the unbanned user if online
+        if target_id in self.clients:
+            unban_msg = Protocol.build_message(
+                MessageType.UNBAN_USER,
+                channel=channel,
+                unbanned_by=client.nickname
+            )
+            await self.clients[target_id].send(unban_msg)
+        
+        # Notify channel
+        announcement = Protocol.build_message(
+            MessageType.CHANNEL_MESSAGE,
+            channel=channel,
+            sender="SERVER",
+            text=f"{target_nickname} was unbanned by {client.nickname}"
+        )
+        for user_id in self.channels.get(channel, set()):
+            if user_id in self.clients:
+                await self.clients[user_id].send(announcement)
+    
+    async def handle_transfer_ownership(self, client: Client, message: dict):
+        """Handle transferring channel ownership"""
+        channel = message.get('channel')
+        target_nickname = message.get('target_nickname')
+        
+        if not channel or not target_nickname:
+            await client.send(Protocol.error("Missing channel or target_nickname"))
+            return
+        
+        # Only current owner can transfer
+        if self.channel_owners.get(channel) != client.user_id:
+            await client.send(Protocol.error("Only the channel owner can transfer ownership"))
+            return
+        
+        # Find target user
+        if target_nickname not in self.nicknames:
+            await client.send(Protocol.error(f"User {target_nickname} not found"))
+            return
+        
+        target_id = self.nicknames[target_nickname]
+        
+        # Target must be in the channel
+        if target_id not in self.channels.get(channel, set()):
+            await client.send(Protocol.error(f"{target_nickname} is not in channel {channel}"))
+            return
+        
+        # Target must be an operator
+        if target_id not in self.channel_operators.get(channel, set()):
+            await client.send(Protocol.error("Can only transfer ownership to an operator"))
+            return
+        
+        # Transfer ownership
+        self.channel_owners[channel] = target_id
+        self.save_channels()
+        
+        logger.info(f"{client.nickname} transferred ownership of {channel} to {target_nickname}")
+        await client.send(Protocol.ack(True, f"Transferred ownership of {channel} to {target_nickname}"))
+        
+        # Notify new owner
+        if target_id in self.clients:
+            await self.clients[target_id].send(Protocol.ack(True, f"You are now the owner of {channel}"))
+        
+        # Notify channel
+        announcement = Protocol.build_message(
+            MessageType.CHANNEL_MESSAGE,
+            channel=channel,
+            sender="SERVER",
+            text=f"{client.nickname} transferred channel ownership to {target_nickname}"
+        )
+        for user_id in self.channels.get(channel, set()):
+            if user_id in self.clients and user_id != client.user_id and user_id != target_id:
+                await self.clients[user_id].send(announcement)
     
     async def handle_set_topic(self, client: Client, message: dict):
         """Handle setting channel topic"""
@@ -772,6 +1322,9 @@ class IRCServer:
                     # Remove from operators
                     if channel in self.channel_operators:
                         self.channel_operators[channel].discard(client.user_id)
+                    # Remove from mods
+                    if channel in self.channel_mods:
+                        self.channel_mods[channel].discard(client.user_id)
                     # Channels are persistent, don't delete
                     # Notify channel members
                     leave_msg = Protocol.build_message(
@@ -783,6 +1336,16 @@ class IRCServer:
                     for user_id in self.channels[channel]:
                         if user_id in self.clients:
                             await self.clients[user_id].send(leave_msg)
+            
+            # Broadcast user disconnect to all remaining clients for global user list update
+            disconnect_msg = Protocol.build_message(
+                MessageType.DISCONNECT,
+                user_id=client.user_id,
+                nickname=client.nickname
+            )
+            for uid, c in self.clients.items():
+                if uid != client.user_id:
+                    await c.send(disconnect_msg)
             
             # Remove from client list
             if client.user_id in self.clients:
