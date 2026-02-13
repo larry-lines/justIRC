@@ -25,24 +25,40 @@ A privacy-focused IRC system with end-to-end encryption, where the server only h
 
 ## Components
 
+### Core Application
 - `server.py` - Routing server (no decryption capabilities)
 - `client.py` - CLI client application
 - `client_gui.py` - Tkinter-based GUI client
 - `crypto_layer.py` - All cryptographic operations
 - `protocol.py` - Message protocol definitions
 
+### MVP Architecture (v1.2.0)
+- `models.py` - Data models (User, Channel, Message, ClientState)
+- `services.py` - Business logic services (Network, State, Message, Channel, Notification)
+- `presenter.py` - MVP presenter coordinating View and Services
+- `dependency_container.py` - IoC container for dependency injection
+- `client_gui_example.py` - Example implementation using MVP pattern
+
 ## Documentation
 
+### User Documentation
 - [FEATURES.md](docs/FEATURES.md) - Complete feature guide with examples
 - [QUICKSTART.md](docs/QUICKSTART.md) - Get started in 5 minutes
 - [SECURITY.md](docs/SECURITY.md) - Security architecture deep dive
-- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - System design & diagrams
-- [DEPLOYMENT.md](docs/DEPLOYMENT.md) - Production deployment guide (includes Docker & GCP)
-- [GCP_DEPLOY.md](docs/GCP_DEPLOY.md) - Quick GCP deployment reference
-- [TOR_SETUP.md](docs/TOR_SETUP.md) - Tor integration for anonymity
-- [THEMES.md](docs/THEMES.md) - Theme customization and logo design guide
-- [PACKAGING.md](docs/PACKAGING.md) - Package as standalone .exe (Windows) or .deb (Linux)
 - [OPERATOR_GUIDE.md](docs/OPERATOR_GUIDE.md) - Channel operator quick reference guide
+- [THEMES.md](docs/THEMES.md) - Theme customization and logo design guide
+
+### Deployment Documentation
+- [DEPLOYMENT.md](docs/DEPLOYMENT.md) - Production deployment guide (includes Docker & GCP)
+- [TOR_SETUP.md](docs/TOR_SETUP.md) - Tor integration for anonymity
+- [PACKAGING.md](docs/PACKAGING.md) - Package as standalone .exe (Windows) or .deb (Linux)
+
+### Developer Documentation
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md) - System design & diagrams
+- [ARCHITECTURE_REFACTORING_SUMMARY.md](ARCHITECTURE_REFACTORING_SUMMARY.md) - MVP architecture implementation (v1.2.0)
+- [PERFORMANCE_SCALABILITY_SUMMARY.md](PERFORMANCE_SCALABILITY_SUMMARY.md) - Performance features (v1.2.0)
+- [DEVELOPER.md](docs/DEVELOPER.md) - Developer setup and API reference
+- [API.md](docs/API.md) - Protocol and API documentation
 
 ## 📦 Standalone Packages (No Python Required!)
 

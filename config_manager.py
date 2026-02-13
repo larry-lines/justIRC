@@ -124,7 +124,8 @@ class ConfigManager:
             "last_server": "localhost",
             "last_port": 6667,
             "last_nickname": ""
-        }
+        },
+        "saved_channels": {}
     }
     
     def __init__(self, config_path: str = "justirc_config.json"):

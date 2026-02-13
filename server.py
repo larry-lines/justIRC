@@ -9,12 +9,17 @@ import argparse
 import json
 import hashlib
 import os
+import time
 from typing import Dict, Set, Optional
 from protocol import Protocol, MessageType
 from rate_limiter import RateLimiter, ConnectionRateLimiter
 from auth_manager import AuthenticationManager
+from profile_manager import ProfileManager
 from input_validator import InputValidator
 from ip_filter import IPFilter
+from message_queue import MessageQueue, MessageBatcher
+from performance_monitor import PerformanceMonitor, ConnectionManager, RoutingOptimizer
+from crypto_layer import CryptoLayer
 
 
 # Configure logging
@@ -35,6 +40,8 @@ class Client:
         self.nickname: str = None
         self.public_key: str = None
         self.channels: Set[str] = set()
+        self.status: str = "online"  # online, away, busy, dnd
+        self.status_message: str = ""
         
         # Get client address (but don't expose it to other clients)
         peername = writer.get_extra_info('peername')
@@ -79,6 +86,10 @@ class IRCServer:
             require_authentication=require_auth
         )
         
+        # Initialize profile manager
+        profiles_file = os.path.join(data_dir, 'user_profiles.json')
+        self.profile_manager = ProfileManager(profiles_file=profiles_file)
+        
         # Track authenticated sessions
         self.authenticated_users: Dict[str, str] = {}  # user_id -> username
         
@@ -109,10 +120,13 @@ class IRCServer:
         self.channel_owners: Dict[str, str] = {}  # channel -> owner user_id
         self.channel_creator_passwords: Dict[str, str] = {}  # channel -> hashed creator password
         self.operator_passwords: Dict[str, Dict[str, str]] = {}  # channel -> {user_id -> hashed_password}
-        self.channel_banned: Dict[str, Set[str]] = {}  # channel -> set of banned user_ids
+        self.channel_banned: Dict[str, Dict[str, dict]] = {}  # channel -> {user_id -> {banned_by, reason, timestamp, expires_at}}
         self.channel_topics: Dict[str, str] = {}  # channel -> topic string
+        self.channel_modes: Dict[str, Set[str]] = {}  # channel -> set of active modes (e.g., {'m', 's', 'i'})
+        self.channel_keys: Dict[str, str] = {}  # channel -> base64 encryption key
         self.nicknames: Dict[str, str] = {}  # nickname -> user_id
         self.pending_op_auth: Dict[str, tuple] = {}  # user_id -> (channel, should_be_op)
+        self.pending_op_grant: Dict[str, dict] = {}  # user_id -> {channel, granted_by, granted_by_id, is_mod}
         
         # Rate limiting
         # Messages: 30 per 10 seconds per client
@@ -125,6 +139,32 @@ class IRCServer:
             time_window=60.0, 
             ban_threshold=10
         )
+        
+        # Performance & Scalability Features
+        max_connections = self.config.get('max_connections', 1000)
+        self.connection_manager = ConnectionManager(
+            max_connections=max_connections,
+            idle_timeout=self.connection_timeout,
+            cleanup_interval=60
+        )
+        
+        self.performance_monitor = PerformanceMonitor(history_size=60)
+        self.routing_optimizer = RoutingOptimizer(cache_size=100)
+        
+        # Message queue for offline users
+        message_queue_dir = os.path.join(data_dir, 'message_queue')
+        max_queued_per_user = self.config.get('max_queued_messages_per_user', 1000)
+        self.message_queue = MessageQueue(
+            storage_dir=message_queue_dir,
+            max_messages_per_user=max_queued_per_user,
+            default_ttl=604800  # 7 days
+        )
+        
+        # Message batcher for efficient transmission
+        self.message_batcher = MessageBatcher(batch_size=10, batch_timeout=0.1)
+        
+        # Background tasks
+        self.background_tasks = []
         
         # Load persistent channel data
         self.load_channels()
@@ -162,25 +202,61 @@ class IRCServer:
                 self.channel_creator_passwords = data.get('channel_creator_passwords', {})
                 
                 # Load operator passwords (already hashed)
-                self.operator_passwords = data.get('operator_passwords', {})
+                # Support both old format (dict of hashes) and new format (dict with role)
+                operator_passwords_data = data.get('operator_passwords', {})
+                self.operator_passwords = {}
+                for channel, users in operator_passwords_data.items():
+                    self.operator_passwords[channel] = {}
+                    for user_id, password_info in users.items():
+                        if isinstance(password_info, str):
+                            # Old format: just the password hash, default to operator
+                            self.operator_passwords[channel][user_id] = {
+                                'password': password_info,
+                                'role': 'operator'
+                            }
+                        else:
+                            # New format: dict with password and role
+                            self.operator_passwords[channel][user_id] = password_info
                 
                 # Load channel owners
                 self.channel_owners = data.get('channel_owners', {})
                 
                 # Load banned users
-                # Convert lists back to sets
+                # Support both old format (list) and new format (dict with metadata)
                 banned_data = data.get('channel_banned', {})
-                for channel, banned_list in banned_data.items():
-                    self.channel_banned[channel] = set(banned_list)
+                for channel, banned_info in banned_data.items():
+                    if isinstance(banned_info, list):
+                        # Old format: convert to new format with no expiration
+                        self.channel_banned[channel] = {}
+                        for user_id in banned_info:
+                            self.channel_banned[channel][user_id] = {
+                                'banned_by': 'SYSTEM',
+                                'reason': 'Legacy ban',
+                                'timestamp': time.time(),
+                                'expires_at': None
+                            }
+                    else:
+                        # New format: already has metadata
+                        self.channel_banned[channel] = banned_info
                 
                 # Load channel topics
                 self.channel_topics = data.get('channel_topics', {})
+                
+                # Load channel modes
+                modes_data = data.get('channel_modes', {})
+                for channel, mode_list in modes_data.items():
+                    self.channel_modes[channel] = set(mode_list)
+                
+                # Load channel encryption keys
+                self.channel_keys = data.get('channel_keys', {})
                 
                 # Initialize empty operator and mod sets for existing channels
                 for channel in self.channel_passwords.keys():
                     self.channel_operators[channel] = set()
                     self.channel_mods[channel] = set()
                     self.channels[channel] = set()
+                    if channel not in self.channel_modes:
+                        self.channel_modes[channel] = set()
                 
                 logger.info(f"Loaded {len(self.channel_passwords)} persistent channels from {self.channels_file}")
             except Exception as e:
@@ -191,27 +267,47 @@ class IRCServer:
     def save_channels(self):
         """Save persistent channel data to file"""
         try:
-            # Convert sets to lists for JSON serialization
-            banned_data = {}
-            for channel, banned_set in self.channel_banned.items():
-                banned_data[channel] = list(banned_set)
+            # Convert channel_modes sets to lists for JSON serialization
+            modes_data = {}
+            for channel, mode_set in self.channel_modes.items():
+                modes_data[channel] = list(mode_set)
             
+            # channel_banned is already JSON-serializable (dict of dicts)
             data = {
                 'channel_passwords': self.channel_passwords,
                 'channel_creator_passwords': self.channel_creator_passwords,
                 'operator_passwords': self.operator_passwords,
                 'channel_owners': self.channel_owners,
-                'channel_banned': banned_data,
-                'channel_topics': self.channel_topics
+                'channel_banned': self.channel_banned,
+                'channel_topics': self.channel_topics,
+                'channel_modes': modes_data,
+                'channel_keys': self.channel_keys
             }
             with open(self.channels_file, 'w') as f:
                 json.dump(data, f, indent=2)
             logger.debug(f"Saved channel data to {self.channels_file}")
         except Exception as e:
             logger.error(f"Error saving channels: {e}")
+            logger.error(f"Error saving channels: {e}")
     
     async def start(self):
         """Start the server"""
+        # Start background tasks
+        self.background_tasks.append(
+            asyncio.create_task(self.check_expired_bans())
+        )
+        self.background_tasks.append(
+            asyncio.create_task(self.periodic_performance_logging())
+        )
+        self.background_tasks.append(
+            asyncio.create_task(self.periodic_queue_save())
+        )
+        
+        # Start connection manager cleanup task
+        self.connection_manager.start_cleanup_task(
+            lambda user_id: self.disconnect_by_user_id(user_id)
+        )
+        
         server = await asyncio.start_server(
             self.handle_client, self.host, self.port
         )
@@ -222,7 +318,40 @@ class IRCServer:
         logger.info('Press Ctrl+C to stop')
         
         async with server:
-            await server.serve_forever()
+            try:
+                await server.serve_forever()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                await self.shutdown()
+    
+    async def check_expired_bans(self):
+        """Background task to check and remove expired bans"""
+        while True:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                
+                current_time = time.time()
+                expired_bans = []
+                
+                # Find all expired bans
+                for channel, banned_users in self.channel_banned.items():
+                    for user_id, ban_info in list(banned_users.items()):
+                        expires_at = ban_info.get('expires_at')
+                        if expires_at and current_time >= expires_at:
+                            expired_bans.append((channel, user_id))
+                
+                # Remove expired bans
+                if expired_bans:
+                    for channel, user_id in expired_bans:
+                        del self.channel_banned[channel][user_id]
+                        logger.info(f"Auto-removed expired ban for user {user_id} in {channel}")
+                    
+                    # Save changes if any bans were removed
+                    self.save_channels()
+                    
+            except Exception as e:
+                logger.error(f"Error in check_expired_bans: {e}")
     
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         """Handle a new client connection"""
@@ -259,6 +388,19 @@ class IRCServer:
                 pass
             return
         
+        # Check connection manager limits
+        if not self.connection_manager.can_accept_connection():
+            logger.warning(f"Connection from {ip_address} rejected: server at capacity")
+            try:
+                error_msg = Protocol.error("Server at maximum capacity, please try again later")
+                writer.write(error_msg.encode('utf-8') + b'\n')
+                await writer.drain()
+                writer.close()
+                await writer.wait_closed()
+            except:
+                pass
+            return
+        
         logger.info(f"New connection from {client.address}")
         
         try:
@@ -286,6 +428,15 @@ class IRCServer:
                 message_str = data.decode('utf-8').strip()
                 if not message_str:
                     continue
+                
+                # Update connection activity
+                if client.user_id:
+                    self.connection_manager.update_activity(client.user_id)
+                    self.performance_monitor.record_message(
+                        client.user_id,
+                        len(data),
+                        direction='received'
+                    )
                 
                 try:
                     message = Protocol.parse_message(message_str)
@@ -362,6 +513,12 @@ class IRCServer:
         elif msg_type == MessageType.KICKBAN_USER.value:
             await self.handle_kickban_user(client, message)
         
+        elif msg_type == MessageType.INVITE_USER.value:
+            await self.handle_invite_user(client, message)
+        
+        elif msg_type == MessageType.INVITE_RESPONSE.value:
+            await self.handle_invite_response(client, message)
+        
         elif msg_type == MessageType.TRANSFER_OWNERSHIP.value:
             await self.handle_transfer_ownership(client, message)
         
@@ -376,6 +533,21 @@ class IRCServer:
         
         elif msg_type == MessageType.SET_TOPIC.value:
             await self.handle_set_topic(client, message)
+        
+        elif msg_type == MessageType.SET_MODE.value:
+            await self.handle_set_mode(client, message)
+        
+        elif msg_type == MessageType.SET_STATUS.value:
+            await self.handle_set_status(client, message)
+        
+        elif msg_type == MessageType.REGISTER_NICKNAME.value:
+            await self.handle_register_nickname(client, message)
+        
+        elif msg_type == MessageType.UPDATE_PROFILE.value:
+            await self.handle_update_profile(client, message)
+        
+        elif msg_type == MessageType.GET_PROFILE.value:
+            await self.handle_get_profile(client, message)
         
         elif msg_type in [MessageType.IMAGE_START.value, 
                          MessageType.IMAGE_CHUNK.value,
@@ -434,8 +606,14 @@ class IRCServer:
             await client.send(Protocol.error(f"Nickname {nickname} already taken"))
             return
         
-        # Generate unique user_id
-        user_id = f"user_{len(self.clients)}_{nickname}"
+        # Generate unique user_id based on nickname (stable across reconnections)
+        user_id = f"user_{nickname}"
+        logger.debug(f"Registering {nickname} with user_id: {user_id}")
+        
+        # Check connection manager capacity
+        if not self.connection_manager.register_connection(user_id):
+            await client.send(Protocol.error("Server at maximum capacity"))
+            return
         
         # Register client
         client.user_id = user_id
@@ -444,6 +622,9 @@ class IRCServer:
         
         self.clients[user_id] = client
         self.nicknames[nickname] = user_id
+        
+        # Register with performance monitor
+        self.performance_monitor.register_connection(user_id)
         
         # Track authentication
         if self.auth_manager.enable_accounts and password:
@@ -462,6 +643,9 @@ class IRCServer:
             description=self.description
         )
         await client.send(response)
+        
+        # Deliver any queued offline messages
+        await self.deliver_queued_messages(client)
         
         # Send list of online users
         await self.send_user_list(client)
@@ -666,14 +850,42 @@ class IRCServer:
         
         to_id = message.get('to_id')
         
+        # Check if recipient is online
         if to_id not in self.clients:
-            await client.send(Protocol.error(f"User {to_id} not found"))
+            # Queue message for offline user
+            logger.info(f"Queuing message from {client.nickname} to offline user {to_id}")
+            
+            self.message_queue.enqueue(
+                recipient_id=to_id,
+                sender_id=client.user_id,
+                sender_nickname=client.nickname,
+                message_type=MessageType.PRIVATE_MESSAGE.value,
+                encrypted_content=json.dumps(message),
+                ttl=604800,  # 7 days
+                metadata={'queued_at': time.time()}
+            )
+            
+            # Acknowledge to sender
+            await client.send(Protocol.ack(
+                success=True,
+                message=f"User {to_id} is offline. Message queued for delivery."
+            ))
             return
         
         target = self.clients[to_id]
         
-        # Just forward the encrypted message as-is
-        await target.send(json.dumps(message))
+        # Add sender nickname to message before forwarding
+        message['from_nickname'] = client.nickname
+        message_str = json.dumps(message)
+        await target.send(message_str)
+        
+        # Track performance
+        self.performance_monitor.record_message(
+            to_id,
+            len(message_str),
+            direction='sent'
+        )
+        
         logger.debug(f"Routed encrypted message from {client.nickname} to {target.nickname}")
     
     async def route_channel_message(self, client: Client, message: dict):
@@ -697,12 +909,44 @@ class IRCServer:
             await client.send(Protocol.error(f"You are not in channel {channel}"))
             return
         
-        # Route to all channel members except sender
-        for user_id in self.channels[channel]:
-            if user_id != client.user_id and user_id in self.clients:
-                await self.clients[user_id].send(json.dumps(message))
+        # Check moderated mode (+m) - only ops and mods can speak
+        if 'm' in self.channel_modes.get(channel, set()):
+            is_op = client.user_id in self.channel_operators.get(channel, set())
+            is_mod = client.user_id in self.channel_mods.get(channel, set())
+            is_owner = self.channel_owners.get(channel) == client.user_id
+            
+            if not (is_op or is_mod or is_owner):
+                await client.send(Protocol.error("Channel is moderated - only operators and mods can speak"))
+                return
         
-        logger.debug(f"Routed channel message from {client.nickname} to {channel}")
+        # Get channel members (use cache if available)
+        members = self.routing_optimizer.get_cached_channel_members(channel)
+        if members is None:
+            members = self.channels[channel]
+            self.routing_optimizer.cache_channel_members(channel, members)
+        
+        # Add sender nickname to message before forwarding
+        message['from_nickname'] = client.nickname
+        message_str = json.dumps(message)
+        
+        # Route to all channel members except sender
+        sent_count = 0
+        for user_id in members:
+            if user_id != client.user_id and user_id in self.clients:
+                await self.clients[user_id].send(message_str)
+                
+                # Track performance
+                self.performance_monitor.record_message(
+                    user_id,
+                    len(message_str),
+                    direction='sent'
+                )
+                sent_count += 1
+        
+        # Record channel activity
+        self.performance_monitor.record_channel_message(channel, len(members))
+        
+        logger.debug(f"Routed channel message from {client.nickname} to {channel} ({sent_count} recipients)")
     
     async def handle_join_channel(self, client: Client, message: dict):
         """Handle channel join request"""
@@ -725,8 +969,20 @@ class IRCServer:
         
         # Check if user is banned from this channel
         if channel in self.channel_banned and client.user_id in self.channel_banned[channel]:
-            await client.send(Protocol.error(f"You are banned from {channel}"))
-            return
+            ban_info = self.channel_banned[channel][client.user_id]
+            expires_at = ban_info.get('expires_at')
+            
+            # Check if ban has expired
+            if expires_at and time.time() >= expires_at:
+                # Ban expired, remove it
+                del self.channel_banned[channel][client.user_id]
+                self.save_channels()
+                logger.info(f"Ban expired for {client.nickname} in {channel}")
+            else:
+                # Ban is still active
+                reason = ban_info.get('reason', 'No reason given')
+                await client.send(Protocol.error(f"You are banned from {channel}: {reason}"))
+                return
         
         # Check if this is a persistent channel (exists in storage)
         channel_exists = channel in self.channel_passwords or channel in self.channel_creator_passwords
@@ -753,7 +1009,12 @@ class IRCServer:
             self.channels[channel] = set()
             self.channel_operators[channel] = set()
             self.channel_mods[channel] = set()
-            self.channel_banned[channel] = set()
+            self.channel_banned[channel] = {}
+            
+            # Create encryption key for the channel
+            crypto = CryptoLayer()
+            channel_key = crypto.create_channel_key(channel)
+            self.channel_keys[channel] = channel_key
             
             # Set user as channel owner
             self.channel_owners[channel] = client.user_id
@@ -779,7 +1040,14 @@ class IRCServer:
             self.channel_operators[channel] = set()
             self.channel_mods[channel] = set()
             if channel not in self.channel_banned:
-                self.channel_banned[channel] = set()
+                self.channel_banned[channel] = {}
+            
+            # Ensure encryption key exists
+            if channel not in self.channel_keys:
+                crypto = CryptoLayer()
+                channel_key = crypto.create_channel_key(channel)
+                self.channel_keys[channel] = channel_key
+                self.save_channels()
             
             # Check if user should regain operator/owner status
             if creator_password and channel in self.channel_creator_passwords:
@@ -793,14 +1061,21 @@ class IRCServer:
                     await client.send(Protocol.error("Incorrect creator password"))
                     return
             
-            # Check join password if set
-            if channel in self.channel_passwords:
+            # Check join password if set (skip if user authenticated as operator)
+            if channel in self.channel_passwords and not should_be_operator:
                 if not password or self.hash_password(password) != self.channel_passwords[channel]:
                     await client.send(Protocol.error("Incorrect channel password"))
                     return
         
         # Scenario 3: Channel is currently active
         elif channel_active:
+            # Ensure encryption key exists (in case of legacy channels)
+            if channel not in self.channel_keys:
+                crypto = CryptoLayer()
+                channel_key = crypto.create_channel_key(channel)
+                self.channel_keys[channel] = channel_key
+                self.save_channels()
+            
             # Check if user should regain operator/owner status
             if creator_password and channel in self.channel_creator_passwords:
                 if self.hash_password(creator_password) == self.channel_creator_passwords[channel]:
@@ -810,22 +1085,77 @@ class IRCServer:
                         is_owner = True
                     logger.info(f"{client.nickname} regaining operator status in {channel}")
             
-            # Check join password if set
-            if channel in self.channel_passwords:
+            # Check join password if set (skip if user authenticated as operator)
+            if channel in self.channel_passwords and not should_be_operator:
                 if not password or self.hash_password(password) != self.channel_passwords[channel]:
                     await client.send(Protocol.error("Incorrect channel password"))
                     return
         
-        # Add client to channel
+        # Check if user has an existing operator password for this channel BEFORE adding to channel
+        # (i.e., they had operator/mod/owner permission previously)
+        # If so, they must verify their password even without providing creator_password
+        has_operator_password = (channel in self.operator_passwords and 
+                                 client.user_id in self.operator_passwords[channel])
+        
+        # Get the stored role for this user (if any)
+        stored_role = None
+        is_stored_mod = False
+        if has_operator_password:
+            password_info = self.operator_passwords[channel][client.user_id]
+            stored_role = password_info.get('role', 'operator')
+            is_stored_mod = (stored_role == 'mod')
+        
+        # Track if user authenticated via creator_password (skip operator password prompt)
+        authenticated_via_creator_password = (
+            creator_password and 
+            channel in self.channel_creator_passwords and
+            self.hash_password(creator_password) == self.channel_creator_passwords[channel]
+        )
+        
+        # Debug logging for reconnection troubleshooting
+        logger.debug(f"Join attempt by {client.nickname} ({client.user_id}) to {channel}:")
+        logger.debug(f"  - has_operator_password: {has_operator_password}")
+        logger.debug(f"  - stored_role: {stored_role}")
+        logger.debug(f"  - should_be_operator: {should_be_operator}")
+        logger.debug(f"  - authenticated_via_creator_password: {authenticated_via_creator_password}")
+        logger.debug(f"  - operator_passwords for channel: {list(self.operator_passwords.get(channel, {}).keys())}")
+        
+        # If user has operator password set, they need to authenticate BEFORE joining
+        # UNLESS they already authenticated with creator_password
+        if has_operator_password and not should_be_operator and not authenticated_via_creator_password:
+            # User previously had operator/mod status, must verify password
+            # Check if they're the owner to maintain that status
+            if channel in self.channel_owners and self.channel_owners[channel] == client.user_id:
+                is_owner = True
+            
+            # Don't add to channel yet - do it in complete_join after authentication
+            # Store role info (True for operator, False for mod based on stored_role)
+            should_be_operator_role = not is_stored_mod
+            self.pending_op_auth[client.user_id] = (channel, should_be_operator_role, is_owner, is_stored_mod)
+            logger.debug(f"Stored pending_op_auth for {client.nickname}: {self.pending_op_auth[client.user_id]}")
+            request_msg = Protocol.build_message(
+                MessageType.OP_PASSWORD_REQUEST,
+                channel=channel,
+                action="verify"
+            )
+            await client.send(request_msg)
+            logger.info(f"Requesting operator password from {client.nickname} for {channel} (existing {stored_role} permissions)")
+            return  # Don't add to channel yet - wait for authentication
+        
+        # Add client to channel NOW (after password check)
         self.channels[channel].add(client.user_id)
         client.channels.add(channel)
         
+        # Invalidate routing cache since membership changed
+        self.routing_optimizer.invalidate_channel_cache(channel)
+        
         # If user should be operator, request password verification
-        if should_be_operator:
+        # UNLESS they already authenticated with creator_password
+        if should_be_operator and not authenticated_via_creator_password:
             # Check if they already have an operator password set
             if channel in self.operator_passwords and client.user_id in self.operator_passwords[channel]:
                 # Ask for password
-                self.pending_op_auth[client.user_id] = (channel, True, is_owner)
+                self.pending_op_auth[client.user_id] = (channel, True, is_owner, False)
                 request_msg = Protocol.build_message(
                     MessageType.OP_PASSWORD_REQUEST,
                     channel=channel,
@@ -836,7 +1166,7 @@ class IRCServer:
                 return  # Don't complete join yet
             else:
                 # First time as operator - ask to set password
-                self.pending_op_auth[client.user_id] = (channel, True, is_owner)
+                self.pending_op_auth[client.user_id] = (channel, True, is_owner, False)
                 request_msg = Protocol.build_message(
                     MessageType.OP_PASSWORD_REQUEST,
                     channel=channel,
@@ -847,12 +1177,22 @@ class IRCServer:
                 return  # Don't complete join yet
         
         # Complete the join process
-        await self.complete_join(client, channel, False, is_owner)
+        await self.complete_join(client, channel, should_be_operator, is_owner)
     
-    async def complete_join(self, client: Client, channel: str, is_operator: bool, is_owner: bool):
+    async def complete_join(self, client: Client, channel: str, is_operator: bool, is_owner: bool, is_mod: bool = False):
         """Complete the join process after authentication"""
-        # Grant operator status if needed
-        if is_operator:
+        # Add client to channel if not already added (happens during operator auth flow)
+        if client.user_id not in self.channels[channel]:
+            self.channels[channel].add(client.user_id)
+            client.channels.add(channel)
+            # Invalidate routing cache since membership changed
+            self.routing_optimizer.invalidate_channel_cache(channel)
+        
+        # Grant operator or mod status if needed
+        if is_mod:
+            self.channel_mods[channel].add(client.user_id)
+            logger.info(f"{client.nickname} joined {channel} as mod")
+        elif is_operator:
             self.channel_operators[channel].add(client.user_id)
             logger.info(f"{client.nickname} joined {channel} as operator")
         else:
@@ -879,7 +1219,8 @@ class IRCServer:
             is_protected=channel in self.channel_passwords,
             is_operator=is_operator,
             is_owner=is_owner,
-            topic=self.channel_topics.get(channel, "")
+            topic=self.channel_topics.get(channel, ""),
+            channel_key=self.channel_keys.get(channel, "")
         )
         await client.send(response)
         
@@ -891,7 +1232,7 @@ class IRCServer:
             channel=channel,
             public_key=client.public_key,
             is_operator=is_operator,
-            is_mod=client.user_id in self.channel_mods.get(channel, set()),
+            is_mod=is_mod,
             is_owner=is_owner
         )
         
@@ -904,18 +1245,94 @@ class IRCServer:
         password = message.get('password')
         channel = message.get('channel')
         
+        logger.debug(f"Received OP_PASSWORD_RESPONSE from {client.nickname} for {channel}")
+        logger.debug(f"  - pending_op_auth: {client.user_id in self.pending_op_auth}")
+        logger.debug(f"  - pending_op_grant: {client.user_id in self.pending_op_grant}")
+        
         if not password:
             await client.send(Protocol.error("Password required"))
-            # Disconnect user
-            await self.disconnect_client(client)
+            # Only disconnect if this was for auth, not for grant
+            if client.user_id in self.pending_op_auth:
+                await self.disconnect_client(client)
             return
         
-        # Check if we're expecting a response from this user
+        # Check if this is for a role grant (someone granting op/mod to this user)
+        if client.user_id in self.pending_op_grant:
+            grant_info = self.pending_op_grant[client.user_id]
+            expected_channel = grant_info['channel']
+            granted_by = grant_info['granted_by']
+            granted_by_id = grant_info['granted_by_id']
+            is_mod = grant_info['is_mod']
+            
+            if channel != expected_channel:
+                await client.send(Protocol.error("Channel mismatch"))
+                del self.pending_op_grant[client.user_id]
+                return
+            
+            # Validate password
+            if len(password) < 4:
+                await client.send(Protocol.error("Password must be at least 4 characters"))
+                del self.pending_op_grant[client.user_id]
+                return
+            
+            # Store the password with role
+            if channel not in self.operator_passwords:
+                self.operator_passwords[channel] = {}
+            self.operator_passwords[channel][client.user_id] = {
+                'password': self.hash_password(password),
+                'role': 'mod' if is_mod else 'operator'
+            }
+            self.save_channels()
+            
+            # Grant the role
+            if is_mod:
+                # Grant mod status
+                if channel not in self.channel_mods:
+                    self.channel_mods[channel] = set()
+                self.channel_mods[channel].add(client.user_id)
+                
+                logger.info(f"{granted_by} granted mod status to {client.nickname} in {channel}")
+                
+                # Notify all channel members (including granter and target)
+                notification = Protocol.build_message(
+                    MessageType.MOD_USER,
+                    channel=channel,
+                    user_id=client.user_id,
+                    nickname=client.nickname,
+                    granted_by=granted_by
+                )
+                for user_id in self.channels[channel]:
+                    if user_id in self.clients:
+                        await self.clients[user_id].send(notification)
+            else:
+                # Grant operator status
+                if channel not in self.channel_operators:
+                    self.channel_operators[channel] = set()
+                self.channel_operators[channel].add(client.user_id)
+                
+                logger.info(f"{granted_by} granted operator status to {client.nickname} in {channel}")
+                
+                # Notify all channel members (including granter and target)
+                notification = Protocol.build_message(
+                    MessageType.OP_USER,
+                    channel=channel,
+                    user_id=client.user_id,
+                    nickname=client.nickname,
+                    granted_by=granted_by
+                )
+                for user_id in self.channels[channel]:
+                    if user_id in self.clients:
+                        await self.clients[user_id].send(notification)
+            
+            del self.pending_op_grant[client.user_id]
+            return
+        
+        # Otherwise, this is for authentication (rejoining with op/mod privileges)
         if client.user_id not in self.pending_op_auth:
             await client.send(Protocol.error("Unexpected password response"))
             return
         
-        expected_channel, should_be_op, is_owner = self.pending_op_auth[client.user_id]
+        expected_channel, should_be_op, is_owner, is_mod = self.pending_op_auth[client.user_id]
         
         if channel != expected_channel:
             await client.send(Protocol.error("Channel mismatch"))
@@ -928,7 +1345,9 @@ class IRCServer:
         
         if client.user_id in self.operator_passwords[channel]:
             # Verify existing password
-            if self.hash_password(password) != self.operator_passwords[channel][client.user_id]:
+            stored_password_info = self.operator_passwords[channel][client.user_id]
+            stored_password = stored_password_info.get('password') if isinstance(stored_password_info, dict) else stored_password_info
+            if self.hash_password(password) != stored_password:
                 await client.send(Protocol.error("Incorrect operator password"))
                 await self.disconnect_client(client)
                 del self.pending_op_auth[client.user_id]
@@ -940,13 +1359,16 @@ class IRCServer:
                 await self.disconnect_client(client)
                 del self.pending_op_auth[client.user_id]
                 return
-            self.operator_passwords[channel][client.user_id] = self.hash_password(password)
+            self.operator_passwords[channel][client.user_id] = {
+                'password': self.hash_password(password),
+                'role': 'mod' if is_mod else 'operator'
+            }
             self.save_channels()
-            logger.info(f"Set operator password for {client.nickname} in {channel}")
+            logger.info(f"Set {'mod' if is_mod else 'operator'} password for {client.nickname} in {channel}")
         
         # Authentication successful
         del self.pending_op_auth[client.user_id]
-        await self.complete_join(client, channel, True, is_owner)
+        await self.complete_join(client, channel, should_be_op, is_owner, is_mod)
     
     async def handle_leave_channel(self, client: Client, message: dict):
         """Handle channel leave request"""
@@ -959,6 +1381,9 @@ class IRCServer:
         # Remove from channel
         self.channels[channel].remove(client.user_id)
         client.channels.discard(channel)
+        
+        # Invalidate routing cache since membership changed
+        self.routing_optimizer.invalidate_channel_cache(channel)
         
         # Remove from operators if they were one
         if channel in self.channel_operators:
@@ -1019,14 +1444,9 @@ class IRCServer:
         """Handle granting operator status to a user - Only owners can do this"""
         channel = message.get('channel')
         target_nickname = message.get('target_nickname')
-        op_password = message.get('op_password')
         
         if not channel or not target_nickname:
             await client.send(Protocol.error("Missing channel or target_nickname"))
-            return
-        
-        if not op_password or len(op_password) < 4:
-            await client.send(Protocol.error("Must provide an operator password (4+ chars) for the new operator"))
             return
         
         # Check if channel exists
@@ -1056,44 +1476,32 @@ class IRCServer:
             await client.send(Protocol.error(f"{target_nickname} is not in channel {channel}"))
             return
         
-        # Grant operator status
-        if channel not in self.channel_operators:
-            self.channel_operators[channel] = set()
-        self.channel_operators[channel].add(target_id)
+        # Check if target is online
+        if target_id not in self.clients:
+            await client.send(Protocol.error(f"{target_nickname} is not currently connected"))
+            return
         
-        # Set their operator password
-        if channel not in self.operator_passwords:
-            self.operator_passwords[channel] = {}
-        self.operator_passwords[channel][target_id] = self.hash_password(op_password)
-        self.save_channels()
+        # Store pending operator grant (will be completed when target sets password)
+        self.pending_op_grant[target_id] = {
+            'channel': channel,
+            'granted_by': client.nickname,
+            'granted_by_id': client.user_id,
+            'is_mod': False
+        }
         
-        logger.info(f"{client.nickname} granted operator status to {target_nickname} in {channel}")
-        
-        # Send acknowledgment
-        await client.send(Protocol.ack(True, f"{target_nickname} is now an operator in {channel}"))
-        
-        # Notify the target user
-        if target_id in self.clients:
-            notification = Protocol.build_message(
-                MessageType.ACK,
-                success=True,
-                message=f"You are now an operator in {channel}",
-                channel=channel,
-                is_operator=True
-            )
-            await self.clients[target_id].send(notification)
-        
-        # Notify all channel members
-        op_notification = Protocol.build_message(
-            MessageType.OP_USER,
+        # Request the target user to set their operator password
+        request_msg = Protocol.build_message(
+            MessageType.OP_PASSWORD_REQUEST,
             channel=channel,
-            user_id=target_id,
-            nickname=target_nickname,
+            action="set",
             granted_by=client.nickname
         )
-        for user_id in self.channels[channel]:
-            if user_id in self.clients and user_id != client.user_id and user_id != target_id:
-                await self.clients[user_id].send(op_notification)
+        await self.clients[target_id].send(request_msg)
+        
+        # Notify the granter
+        await client.send(Protocol.ack(True, f"Password request sent to {target_nickname}"))
+        
+        logger.info(f"{client.nickname} initiated operator grant to {target_nickname} in {channel}")
     
     async def handle_kick_user(self, client: Client, message: dict):
         """Handle kicking a user from a channel"""
@@ -1228,7 +1636,7 @@ class IRCServer:
             if target_id in self.clients:
                 await self.clients[target_id].send(Protocol.ack(True, f"You are no longer an operator in {channel}"))
             
-            # Notify channel
+            # Notify ALL channel members (including remover and target)
             notification = Protocol.build_message(
                 MessageType.UNOP_USER,
                 channel=channel,
@@ -1237,7 +1645,7 @@ class IRCServer:
                 removed_by=client.nickname
             )
             for user_id in self.channels[channel]:
-                if user_id in self.clients and user_id != client.user_id and user_id != target_id:
+                if user_id in self.clients:
                     await self.clients[user_id].send(notification)
         else:
             await client.send(Protocol.error(f"{target_nickname} is not an operator"))
@@ -1276,29 +1684,33 @@ class IRCServer:
             await client.send(Protocol.error(f"{target_nickname} is not in channel {channel}"))
             return
         
-        # Grant mod status
-        if channel not in self.channel_mods:
-            self.channel_mods[channel] = set()
-        self.channel_mods[channel].add(target_id)
+        # Check if target is online
+        if target_id not in self.clients:
+            await client.send(Protocol.error(f"{target_nickname} is not currently connected"))
+            return
         
-        logger.info(f"{client.nickname} granted mod status to {target_nickname} in {channel}")
-        await client.send(Protocol.ack(True, f"{target_nickname} is now a mod in {channel}"))
+        # Store pending mod grant (will be completed when target sets password)
+        self.pending_op_grant[target_id] = {
+            'channel': channel,
+            'granted_by': client.nickname,
+            'granted_by_id': client.user_id,
+            'is_mod': True
+        }
         
-        # Notify target
-        if target_id in self.clients:
-            await self.clients[target_id].send(Protocol.ack(True, f"You are now a mod in {channel}"))
-        
-        # Notify channel
-        notification = Protocol.build_message(
-            MessageType.MOD_USER,
+        # Request the target user to set their mod password
+        request_msg = Protocol.build_message(
+            MessageType.OP_PASSWORD_REQUEST,
             channel=channel,
-            user_id=target_id,
-            nickname=target_nickname,
-            granted_by=client.nickname
+            action="set",
+            granted_by=client.nickname,
+            is_mod=True
         )
-        for user_id in self.channels[channel]:
-            if user_id in self.clients and user_id != client.user_id and user_id != target_id:
-                await self.clients[user_id].send(notification)
+        await self.clients[target_id].send(request_msg)
+        
+        # Notify the granter
+        await client.send(Protocol.ack(True, f"Password request sent to {target_nickname}"))
+        
+        logger.info(f"{client.nickname} initiated mod grant to {target_nickname} in {channel}")
     
     async def handle_unmod_user(self, client: Client, message: dict):
         """Handle removing mod status from a user"""
@@ -1327,6 +1739,11 @@ class IRCServer:
         # Remove mod status
         if channel in self.channel_mods and target_id in self.channel_mods[channel]:
             self.channel_mods[channel].remove(target_id)
+            # Also remove their operator password (mods use the same password system)
+            if channel in self.operator_passwords and target_id in self.operator_passwords[channel]:
+                del self.operator_passwords[channel][target_id]
+                self.save_channels()
+            
             logger.info(f"{client.nickname} removed mod status from {target_nickname} in {channel}")
             await client.send(Protocol.ack(True, f"{target_nickname} is no longer a mod"))
             
@@ -1334,7 +1751,7 @@ class IRCServer:
             if target_id in self.clients:
                 await self.clients[target_id].send(Protocol.ack(True, f"You are no longer a mod in {channel}"))
             
-            # Notify channel
+            # Notify ALL channel members (including remover and target)
             notification = Protocol.build_message(
                 MessageType.UNMOD_USER,
                 channel=channel,
@@ -1343,7 +1760,7 @@ class IRCServer:
                 removed_by=client.nickname
             )
             for user_id in self.channels[channel]:
-                if user_id in self.clients and user_id != client.user_id and user_id != target_id:
+                if user_id in self.clients:
                     await self.clients[user_id].send(notification)
         else:
             await client.send(Protocol.error(f"{target_nickname} is not a mod"))
@@ -1353,6 +1770,7 @@ class IRCServer:
         channel = message.get('channel')
         target_nickname = message.get('target_nickname')
         reason = message.get('reason', 'No reason given')
+        duration = message.get('duration')  # Optional: duration in seconds for timed ban
         
         if not channel or not target_nickname:
             await client.send(Protocol.error("Missing channel or target_nickname"))
@@ -1383,14 +1801,35 @@ class IRCServer:
             await client.send(Protocol.error("Cannot ban yourself"))
             return
         
-        # Add to ban list
+        # Calculate expiration time if duration provided
+        expires_at = None
+        if duration and duration > 0:
+            expires_at = time.time() + duration
+        
+        # Add to ban list with metadata
         if channel not in self.channel_banned:
-            self.channel_banned[channel] = set()
-        self.channel_banned[channel].add(target_id)
+            self.channel_banned[channel] = {}
+        self.channel_banned[channel][target_id] = {
+            'banned_by': client.user_id,
+            'banned_by_nickname': client.nickname,
+            'reason': reason,
+            'timestamp': time.time(),
+            'expires_at': expires_at
+        }
         self.save_channels()
         
-        logger.info(f"{client.nickname} banned {target_nickname} from {channel}: {reason}")
-        await client.send(Protocol.ack(True, f"{target_nickname} has been banned from {channel}"))
+        # Build response message
+        ban_msg = f"{target_nickname} has been banned from {channel}"
+        if duration:
+            hours = duration // 3600
+            minutes = (duration % 3600) // 60
+            if hours > 0:
+                ban_msg += f" for {hours}h {minutes}m"
+            else:
+                ban_msg += f" for {minutes}m"
+        
+        logger.info(f"{client.nickname} banned {target_nickname} from {channel}: {reason} (duration: {duration})")
+        await client.send(Protocol.ack(True, ban_msg))
         
         # If user is in channel, kick them
         if target_id in self.channels.get(channel, set()):
@@ -1460,7 +1899,7 @@ class IRCServer:
             return
         
         # Remove from ban list
-        self.channel_banned[channel].discard(target_id)
+        del self.channel_banned[channel][target_id]
         self.save_channels()
         
         logger.info(f"{client.nickname} unbanned {target_nickname} from {channel}")
@@ -1485,6 +1924,101 @@ class IRCServer:
         for user_id in self.channels.get(channel, set()):
             if user_id in self.clients:
                 await self.clients[user_id].send(announcement)
+    
+    async def handle_invite_user(self, client: Client, message: dict):
+        """Handle inviting a user to a channel"""
+        channel = message.get('channel')
+        target_nickname = message.get('target_nickname')
+        
+        if not channel or not target_nickname:
+            await client.send(Protocol.error("Missing channel or target_nickname"))
+            return
+        
+        # Check if inviter is in the channel
+        if channel not in self.channels or client.user_id not in self.channels[channel]:
+            await client.send(Protocol.error("You must be in the channel to invite users"))
+            return
+        
+        # Only operators and owners can send invites
+        is_op = client.user_id in self.channel_operators.get(channel, set())
+        is_owner = self.channel_owners.get(channel) == client.user_id
+        
+        if not (is_op or is_owner):
+            await client.send(Protocol.error("Only operators can invite users"))
+            return
+        
+        # Find target user
+        if target_nickname not in self.nicknames:
+            await client.send(Protocol.error(f"User {target_nickname} not found"))
+            return
+        
+        target_id = self.nicknames[target_nickname]
+        
+        # Check if target is already in channel
+        if target_id in self.channels.get(channel, set()):
+            await client.send(Protocol.error(f"{target_nickname} is already in {channel}"))
+            return
+        
+        # Send invite to target user
+        if target_id in self.clients:
+            invite_msg = Protocol.build_message(
+                MessageType.INVITE_USER,
+                channel=channel,
+                inviter_nickname=client.nickname,
+                inviter_id=client.user_id
+            )
+            await self.clients[target_id].send(invite_msg)
+            
+            logger.info(f"{client.nickname} invited {target_nickname} to {channel}")
+            await client.send(Protocol.ack(True, f"Invited {target_nickname} to {channel}"))
+        else:
+            await client.send(Protocol.error(f"{target_nickname} is not online"))
+    
+    async def handle_invite_response(self, client: Client, message: dict):
+        """Handle user's response to a channel invite"""
+        channel = message.get('channel')
+        inviter_nickname = message.get('inviter_nickname')
+        accepted = message.get('accepted', False)
+        
+        if not channel or not inviter_nickname:
+            await client.send(Protocol.error("Missing channel or inviter_nickname"))
+            return
+        
+        if accepted:
+            # User accepted, join them to the channel
+            # Reuse the join channel logic
+            join_msg = {
+                'type': MessageType.JOIN_CHANNEL.value,
+                'channel': channel
+            }
+            await self.handle_join_channel(client, join_msg)
+            
+            # Notify the inviter if online
+            if inviter_nickname in self.nicknames:
+                inviter_id = self.nicknames[inviter_nickname]
+                if inviter_id in self.clients:
+                    notification = Protocol.build_message(
+                        MessageType.CHANNEL_MESSAGE,
+                        channel=channel,
+                        sender="SERVER",
+                        text=f"{client.nickname} accepted your invite"
+                    )
+                    await self.clients[inviter_id].send(notification)
+        else:
+            # User declined
+            logger.info(f"{client.nickname} declined invite to {channel} from {inviter_nickname}")
+            
+            # Notify the inviter if online
+            if inviter_nickname in self.nicknames:
+                inviter_id = self.nicknames[inviter_nickname]
+                if inviter_id in self.clients and inviter_id in self.channels.get(channel, set()):
+                    notification = Protocol.build_message(
+                        MessageType.CHANNEL_MESSAGE,
+                        channel=channel,
+                        sender="SERVER",
+                        text=f"{client.nickname} declined your invite"
+                    )
+                    await self.clients[inviter_id].send(notification)
     
     async def handle_transfer_ownership(self, client: Client, message: dict):
         """Handle transferring channel ownership"""
@@ -1582,6 +2116,187 @@ class IRCServer:
             if user_id in self.clients and user_id != client.user_id:
                 await self.clients[user_id].send(topic_notification)
     
+    async def handle_set_status(self, client: Client, message: dict):
+        """Handle user status change"""
+        status = message.get('status', 'online')
+        custom_message = message.get('custom_message', '')
+        
+        # Validate status
+        valid_statuses = ['online', 'away', 'busy', 'dnd']
+        if status not in valid_statuses:
+            await client.send(Protocol.error(f"Invalid status. Must be one of: {', '.join(valid_statuses)}"))
+            return
+        
+        # Update client status
+        client.status = status
+        client.status_message = custom_message[:100]  # Limit to 100 chars
+        
+        logger.info(f"{client.nickname} set status to {status}: {custom_message}")
+        
+        # Send acknowledgment
+        await client.send(Protocol.ack(True, f"Status set to {status}"))
+        
+        # Broadcast status update to all users who share a channel with this user
+        notified_users = set()
+        for channel in client.channels:
+            if channel in self.channels:
+                for user_id in self.channels[channel]:
+                    if user_id != client.user_id and user_id not in notified_users:
+                        notified_users.add(user_id)
+                        if user_id in self.clients:
+                            status_update = Protocol.build_message(
+                                MessageType.STATUS_UPDATE,
+                                user_id=client.user_id,
+                                nickname=client.nickname,
+                                status=status,
+                                custom_message=custom_message
+                            )
+                            await self.clients[user_id].send(status_update)
+    
+    async def handle_register_nickname(self, client: Client, message: dict):
+        """Handle nickname registration"""
+        if not client.nickname:
+            await client.send(Protocol.error("You must be connected to register a nickname"))
+            return
+        
+        nickname = message.get('nickname')
+        password = message.get('password')
+        
+        if not nickname or not password:
+            await client.send(Protocol.error("Missing nickname or password"))
+            return
+        
+        # Verify that the nickname matches the client's current nickname
+        if nickname != client.nickname:
+            await client.send(Protocol.error("You can only register your current nickname"))
+            return
+        
+        # Attempt to register the nickname
+        success, msg = self.profile_manager.register_nickname(nickname, password)
+        
+        if success:
+            logger.info(f"Nickname registered: {nickname}")
+            await client.send(Protocol.ack(True, msg))
+        else:
+            await client.send(Protocol.error(msg))
+    
+    async def handle_update_profile(self, client: Client, message: dict):
+        """Handle profile update"""
+        if not client.nickname:
+            await client.send(Protocol.error("You must be connected to update your profile"))
+            return
+        
+        bio = message.get('bio')
+        status_message = message.get('status_message')
+        avatar = message.get('avatar')
+        
+        # Update profile
+        success, msg = self.profile_manager.update_profile(
+            client.nickname,
+            bio=bio,
+            status_message=status_message,
+            avatar=avatar
+        )
+        
+        if success:
+            logger.info(f"Profile updated for {client.nickname}")
+            await client.send(Protocol.ack(True, msg))
+        else:
+            await client.send(Protocol.error(msg))
+    
+    async def handle_get_profile(self, client: Client, message: dict):
+        """Handle profile request"""
+        target_nickname = message.get('target_nickname')
+        
+        if not target_nickname:
+            await client.send(Protocol.error("Missing target nickname"))
+            return
+        
+        # Get profile from profile manager
+        profile = self.profile_manager.get_profile(target_nickname)
+        
+        if profile:
+            # Send profile response
+            response = Protocol.profile_response(
+                nickname=target_nickname,
+                bio=profile.get('bio'),
+                status_message=profile.get('status_message'),
+                avatar=profile.get('avatar'),
+                registered=profile.get('registered', False),
+                registration_date=profile.get('registration_date')
+            )
+            await client.send(response)
+        else:
+            await client.send(Protocol.error(f"Profile not found for {target_nickname}"))
+    
+    async def handle_set_mode(self, client: Client, message: dict):
+        """Handle setting channel modes"""
+        channel = message.get('channel')
+        mode = message.get('mode')
+        enable = message.get('enable', True)
+        
+        if not channel or not mode:
+            await client.send(Protocol.error("Missing channel or mode"))
+            return
+        
+        # Only operators and owners can set modes
+        is_op = client.user_id in self.channel_operators.get(channel, set())
+        is_owner = self.channel_owners.get(channel) == client.user_id
+        
+        if not (is_op or is_owner):
+            await client.send(Protocol.error("Only operators can set channel modes"))
+            return
+        
+        # Validate mode
+        valid_modes = {'m', 's', 'i', 'n', 'p'}  # moderated, secret, invite-only, no external messages, private
+        if mode not in valid_modes:
+            await client.send(Protocol.error(f"Unknown mode: {mode}. Valid modes: {', '.join(valid_modes)}"))
+            return
+        
+        # Initialize modes for channel if needed
+        if channel not in self.channel_modes:
+            self.channel_modes[channel] = set()
+        
+        # Apply mode
+        mode_changed = False
+        if enable:
+            if mode not in self.channel_modes[channel]:
+                self.channel_modes[channel].add(mode)
+                mode_changed = True
+        else:
+            if mode in self.channel_modes[channel]:
+                self.channel_modes[channel].discard(mode)
+                mode_changed = True
+        
+        if not mode_changed:
+            mode_status = "enabled" if enable else "disabled"
+            await client.send(Protocol.ack(True, f"Mode {mode} is already {mode_status}"))
+            return
+        
+        # Save changes
+        self.save_channels()
+        
+        # Mode descriptions
+        mode_names = {
+            'm': 'moderated (only ops/mods can speak)',
+            's': 'secret (hidden from channel list)',
+            'i': 'invite-only',
+            'n': 'no external messages',
+            'p': 'private (hide user list from non-members)'
+        }
+        
+        mode_action = "enabled" if enable else "disabled"
+        mode_desc = mode_names.get(mode, mode)
+        
+        logger.info(f"{client.nickname} {mode_action} mode +{mode} in {channel}")
+        await client.send(Protocol.ack(True, f"Mode +{mode} ({mode_desc}) {mode_action}"))
+        
+        # Notify all channel members
+        notification = Protocol.mode_change(channel, mode, enable, client.nickname)
+        for user_id in self.channels.get(channel, set()):
+            if user_id in self.clients and user_id != client.user_id:
+                await self.clients[user_id].send(notification)
+    
     async def handle_whois(self, client: Client, message: dict):
         """Handle whois request"""
         target_nickname = message.get('target_nickname')
@@ -1640,7 +2355,9 @@ class IRCServer:
             {
                 "user_id": uid,
                 "nickname": c.nickname,
-                "public_key": c.public_key
+                "public_key": c.public_key,
+                "status": c.status,
+                "status_message": c.status_message
             }
             for uid, c in self.clients.items()
         ]
@@ -1654,7 +2371,9 @@ class IRCServer:
             users=[{
                 "user_id": new_client.user_id,
                 "nickname": new_client.nickname,
-                "public_key": new_client.public_key
+                "public_key": new_client.public_key,
+                "status": new_client.status,
+                "status_message": new_client.status_message
             }]
         )
         
@@ -1665,12 +2384,35 @@ class IRCServer:
     async def disconnect_client(self, client: Client):
         """Disconnect a client and clean up"""
         if client.user_id:
-            logger.info(f"Client {client.nickname} disconnected")
+            logger.info(f"Client {client.nickname} ({client.user_id}) disconnected")
+            
+            # Debug: Show operator_passwords state before cleanup
+            for channel in list(client.channels):
+                if channel in self.operator_passwords and client.user_id in self.operator_passwords[channel]:
+                    password_info = self.operator_passwords[channel][client.user_id]
+                    role = password_info.get('role', 'operator') if isinstance(password_info, dict) else 'operator'
+                    logger.debug(f"  - {client.nickname} has {role} password for {channel} (will persist)")
+            
+            # Clean up pending operator authentication/grant states
+            if client.user_id in self.pending_op_auth:
+                del self.pending_op_auth[client.user_id]
+                logger.debug(f"Cleaned up pending_op_auth for {client.nickname}")
+            if client.user_id in self.pending_op_grant:
+                del self.pending_op_grant[client.user_id]
+                logger.debug(f"Cleaned up pending_op_grant for {client.nickname}")
+            
+            # Unregister from managers
+            self.connection_manager.unregister_connection(client.user_id)
+            self.performance_monitor.unregister_connection(client.user_id)
             
             # Remove from all channels
             for channel in list(client.channels):
                 if channel in self.channels:
                     self.channels[channel].discard(client.user_id)
+                    
+                    # Invalidate routing cache
+                    self.routing_optimizer.invalidate_channel_cache(channel)
+                    
                     # Remove from operators
                     if channel in self.channel_operators:
                         self.channel_operators[channel].discard(client.user_id)
@@ -1712,6 +2454,139 @@ class IRCServer:
             await client.writer.wait_closed()
         except:
             pass
+
+
+    async def deliver_queued_messages(self, client: Client):
+        """Deliver any queued messages to a client upon reconnection"""
+        if not client.user_id:
+            return
+        
+        queued_messages = self.message_queue.dequeue_all(client.user_id)
+        
+        if not queued_messages:
+            return
+        
+        logger.info(f"Delivering {len(queued_messages)} queued messages to {client.nickname}")
+        
+        for queued_msg in queued_messages:
+            try:
+                # Send the queued encrypted message
+                await client.send(queued_msg.encrypted_content)
+                
+                # Track performance
+                self.performance_monitor.record_message(
+                    client.user_id,
+                    len(queued_msg.encrypted_content),
+                    direction='sent'
+                )
+            except Exception as e:
+                logger.error(f"Error delivering queued message to {client.nickname}: {e}")
+        
+        # Notify client about delivered messages
+        notification = Protocol.build_message(
+            MessageType.ACK,
+            success=True,
+            message=f"Delivered {len(queued_messages)} queued message(s)"
+        )
+        await client.send(notification)
+    
+    async def disconnect_by_user_id(self, user_id: str):
+        """Disconnect a client by user_id (for idle timeout)"""
+        if user_id in self.clients:
+            client = self.clients[user_id]
+            logger.info(f"Disconnecting idle client: {client.nickname}")
+            await self.disconnect_client(client)
+    
+    async def periodic_performance_logging(self):
+        """Background task to log performance statistics"""
+        while True:
+            try:
+                await asyncio.sleep(300)  # Log every 5 minutes
+                self.performance_monitor.log_summary()
+                
+                # Log queue stats
+                queue_stats = self.message_queue.get_stats()
+                if queue_stats['total_messages_waiting'] > 0:
+                    logger.info(
+                        f"Message Queue: {queue_stats['active_queues']} queues, "
+                        f"{queue_stats['total_messages_waiting']} messages waiting"
+                    )
+                
+                # Log connection manager stats
+                conn_stats = self.connection_manager.get_stats()
+                logger.info(
+                    f"Connections: {conn_stats['active_connections']}/{conn_stats['max_connections']} "
+                    f"({conn_stats['utilization']:.1f}% utilization)"
+                )
+                
+                # Log routing cache stats
+                cache_stats = self.routing_optimizer.get_cache_stats()
+                if cache_stats['cache_hits'] + cache_stats['cache_misses'] > 0:
+                    logger.info(
+                        f"Routing Cache: {cache_stats['hit_rate']:.1f}% hit rate, "
+                        f"{cache_stats['cached_channels']} channels cached"
+                    )
+                
+                # Take performance snapshot
+                self.performance_monitor.take_snapshot()
+                
+            except asyncio.CancelledError:
+                logger.info("Performance logging task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in performance logging: {e}")
+    
+    async def periodic_queue_save(self):
+        """Background task to periodically save message queue to disk"""
+        while True:
+            try:
+                await asyncio.sleep(60)  # Save every minute
+                self.message_queue.save_to_disk()
+                
+                # Cleanup expired messages
+                self.message_queue.cleanup_expired()
+                
+            except asyncio.CancelledError:
+                logger.info("Queue save task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in queue save task: {e}")
+    
+    async def shutdown(self):
+        """Shutdown server gracefully"""
+        logger.info("Starting server shutdown...")
+        
+        # Cancel all background tasks
+        for task in self.background_tasks:
+            task.cancel()
+        
+        # Stop connection manager cleanup
+        self.connection_manager.stop_cleanup_task()
+        
+        # Wait for background tasks to finish
+        await asyncio.gather(*self.background_tasks, return_exceptions=True)
+        
+        # Save message queue
+        self.message_queue.shutdown()
+        
+        # Save channels
+        self.save_channels()
+        
+        # Log final statistics
+        logger.info("=== Final Server Statistics ===")
+        self.performance_monitor.log_summary()
+        
+        queue_stats = self.message_queue.get_stats()
+        logger.info(f"Message Queue: {queue_stats['total_queued']} queued, "
+                   f"{queue_stats['total_delivered']} delivered, "
+                   f"{queue_stats['total_expired']} expired")
+        
+        conn_stats = self.connection_manager.get_stats()
+        logger.info(f"Connections: {conn_stats['total_accepted']} accepted, "
+                   f"{conn_stats['total_rejected']} rejected, "
+                   f"{conn_stats['total_idle_timeouts']} idle timeouts")
+        
+        logger.info("Server shutdown complete")
 
 
 def main():

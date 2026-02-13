@@ -44,6 +44,10 @@ class MessageType(Enum):
     BAN_USER = "ban_user"
     UNBAN_USER = "unban_user"
     KICKBAN_USER = "kickban_user"
+    INVITE_USER = "invite_user"
+    INVITE_RESPONSE = "invite_response"
+    SET_MODE = "set_mode"
+    MODE_CHANGE = "mode_change"
     SET_TOPIC = "set_topic"
     TRANSFER_OWNERSHIP = "transfer_ownership"
     OP_PASSWORD_REQUEST = "op_password_request"
@@ -58,6 +62,12 @@ class MessageType(Enum):
     # User status
     SET_STATUS = "set_status"
     STATUS_UPDATE = "status_update"
+    
+    # User profiles
+    REGISTER_NICKNAME = "register_nickname"
+    UPDATE_PROFILE = "update_profile"
+    GET_PROFILE = "get_profile"
+    PROFILE_RESPONSE = "profile_response"
     
     # File transfer
     IMAGE_START = "image_start"
@@ -332,6 +342,66 @@ class Protocol:
         )
     
     @staticmethod
+    def register_nickname(nickname: str, password: str) -> str:
+        """Create a nickname registration message"""
+        return Protocol.build_message(
+            MessageType.REGISTER_NICKNAME,
+            nickname=nickname,
+            password=password
+        )
+    
+    @staticmethod
+    def update_profile(bio: Optional[str] = None, 
+                      status_message: Optional[str] = None,
+                      avatar: Optional[str] = None) -> str:
+        """Create a profile update message"""
+        profile_data = {}
+        if bio is not None:
+            profile_data['bio'] = bio
+        if status_message is not None:
+            profile_data['status_message'] = status_message
+        if avatar is not None:
+            profile_data['avatar'] = avatar
+        
+        return Protocol.build_message(
+            MessageType.UPDATE_PROFILE,
+            **profile_data
+        )
+    
+    @staticmethod
+    def get_profile(target_nickname: str) -> str:
+        """Create a profile request message"""
+        return Protocol.build_message(
+            MessageType.GET_PROFILE,
+            target_nickname=target_nickname
+        )
+    
+    @staticmethod
+    def profile_response(nickname: str, bio: Optional[str] = None,
+                        status_message: Optional[str] = None,
+                        avatar: Optional[str] = None,
+                        registered: bool = False,
+                        registration_date: Optional[str] = None) -> str:
+        """Create a profile response message"""
+        profile_data = {
+            'nickname': nickname,
+            'registered': registered
+        }
+        if bio:
+            profile_data['bio'] = bio
+        if status_message:
+            profile_data['status_message'] = status_message
+        if avatar:
+            profile_data['avatar'] = avatar
+        if registration_date:
+            profile_data['registration_date'] = registration_date
+        
+        return Protocol.build_message(
+            MessageType.PROFILE_RESPONSE,
+            **profile_data
+        )
+    
+    @staticmethod
     def kick_user(channel: str, target_nickname: str, reason: str = "") -> str:
         """Create a kick user message"""
         return Protocol.build_message(
@@ -342,12 +412,52 @@ class Protocol:
         )
     
     @staticmethod
+    def invite_user(channel: str, target_nickname: str) -> str:
+        """Create an invite user message"""
+        return Protocol.build_message(
+            MessageType.INVITE_USER,
+            channel=channel,
+            target_nickname=target_nickname
+        )
+    
+    @staticmethod
+    def invite_response(channel: str, inviter_nickname: str, accepted: bool) -> str:
+        """Create an invite response message"""
+        return Protocol.build_message(
+            MessageType.INVITE_RESPONSE,
+            channel=channel,
+            inviter_nickname=inviter_nickname,
+            accepted=accepted
+        )
+    
+    @staticmethod
     def set_topic(channel: str, topic: str) -> str:
         """Create a set topic message"""
         return Protocol.build_message(
             MessageType.SET_TOPIC,
             channel=channel,
             topic=topic
+        )
+    
+    @staticmethod
+    def set_mode(channel: str, mode: str, enable: bool) -> str:
+        """Create a set mode message (+m, +s, +i, etc.)"""
+        return Protocol.build_message(
+            MessageType.SET_MODE,
+            channel=channel,
+            mode=mode,
+            enable=enable
+        )
+    
+    @staticmethod
+    def mode_change(channel: str, mode: str, enabled: bool, set_by: str) -> str:
+        """Create a mode change notification"""
+        return Protocol.build_message(
+            MessageType.MODE_CHANGE,
+            channel=channel,
+            mode=mode,
+            enabled=enabled,
+            set_by=set_by
         )
     
     @staticmethod

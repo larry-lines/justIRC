@@ -41,6 +41,9 @@ class CryptoLayer:
         self.max_messages_per_key = max_messages_per_key
         self.peer_key_timestamp: Dict[str, float] = {}  # peer_id -> timestamp
         self.peer_message_count: Dict[str, int] = {}  # peer_id -> message count
+        
+        # Channel (group) encryption keys
+        self.channel_keys: Dict[str, bytes] = {}
     
     def get_public_key_bytes(self) -> bytes:
         """Get public key as bytes"""
@@ -284,6 +287,46 @@ class CryptoLayer:
             del self.peer_key_timestamp[peer_id]
         if peer_id in self.peer_message_count:
             del self.peer_message_count[peer_id]
+    
+    def create_channel_key(self, channel: str) -> str:
+        """Create a new channel key and return it as base64"""
+        key = ChaCha20Poly1305.generate_key()
+        self.channel_keys[channel] = key
+        return base64.b64encode(key).decode('utf-8')
+    
+    def load_channel_key(self, channel: str, key_b64: str):
+        """Load a channel key from base64"""
+        key = base64.b64decode(key_b64)
+        self.channel_keys[channel] = key
+    
+    def encrypt_for_channel(self, channel: str, plaintext: str) -> Tuple[str, str]:
+        """Encrypt message for a channel"""
+        if channel not in self.channel_keys:
+            raise ValueError(f"No key for channel {channel}")
+        
+        nonce = os.urandom(12)
+        cipher = ChaCha20Poly1305(self.channel_keys[channel])
+        ciphertext = cipher.encrypt(nonce, plaintext.encode('utf-8'), None)
+        
+        return (
+            base64.b64encode(ciphertext).decode('utf-8'),
+            base64.b64encode(nonce).decode('utf-8')
+        )
+    
+    def decrypt_from_channel(self, channel: str, encrypted_data_b64: str, nonce_b64: str) -> str:
+        """Decrypt message from a channel"""
+        if channel not in self.channel_keys:
+            raise ValueError(f"No key for channel {channel}")
+        
+        ciphertext = base64.b64decode(encrypted_data_b64)
+        nonce = base64.b64decode(nonce_b64)
+        
+        cipher = ChaCha20Poly1305(self.channel_keys[channel])
+        try:
+            plaintext = cipher.decrypt(nonce, ciphertext, None)
+            return plaintext.decode('utf-8')
+        except Exception as e:
+            raise ValueError(f"Channel decryption failed: {e}")
 
 
 class ChannelCrypto:

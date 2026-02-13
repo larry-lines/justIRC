@@ -221,8 +221,8 @@ class TestChannelCrypto(unittest.TestCase):
     
     def setUp(self):
         """Set up test fixtures"""
-        self.crypto = ChannelCrypto()
-        self.crypto2 = ChannelCrypto()
+        self.crypto = CryptoLayer()
+        self.crypto2 = CryptoLayer()
     
     def test_channel_key_creation(self):
         """Test channel key creation"""

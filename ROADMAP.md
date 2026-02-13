@@ -72,71 +72,59 @@ This document outlines planned improvements and future development for JustIRC. 
   - ✅ Export chat logs (encrypted format)
 
 - [ ] **Enhanced Channel Features**
-  - Channel topics with permission controls
-  - Persistent channel bans and mutes
-  - Timed bans (kick with auto-unban)
-  - Channel invite system
-  - Channel modes (+m moderated, +s secret, etc.)
+  - [x] Channel topics with permission controls
+  - [x] Persistent channel bans and mutes
+  - [x] Timed bans (kick with auto-unban)
+  - [x] Channel invite system
+  - [x] Channel modes (+m moderated, +s secret, etc.)
 
 - [ ] **User Features**
-  - User profiles (bio, status message)
-  - Custom user statuses (away, busy, DND)
-  - Nickname registration and protection
-  - User blocking (client-side)
-  - User mentions with @ notifications
+  - [x] User profiles (bio, status message)
+  - [x] Custom user statuses (away, busy, DND)
+  - [x] Nickname registration and protection
+  - [x] User blocking (client-side)
+  - [x] User mentions with @ notifications
 
 #### File Sharing
-- [ ] **Enhanced File Transfer**
-  - Support for any file type (not just images)
-  - Resume interrupted transfers
-  - Batch file uploads
-  - File size limits and validation
-  - Progress bars for large transfers
+- [x] **Enhanced File Transfer**
+  - [x] Support for any file type (not just images)
+  - [x] Resume interrupted transfers
+  - [x] Batch file uploads
+  - [x] File size limits and validation
+  - [x] Progress bars for large transfers
 
 ### Code Quality
-- [ ] **Refactoring**
-  - Split large files (client_gui.py: 2460 lines)
-  - Extract common utilities into shared module
-  - Reduce code duplication
-  - Improve error handling consistency
+- [x] **Refactoring**
+  - [x] Split large files (client_gui.py: reduced from 3520 to 2377 lines - 32%)
+  - [x] Extract common utilities into shared modules
+  - [x] Reduce code duplication
+  - [ ] Improve error handling consistency
   
-- [ ] **Architecture Improvements**
-  - Implement proper event bus/observer pattern
-  - Separate business logic from UI (MVC/MVP)
-  - Add dependency injection for testability
-  - Consider async/await improvements
+- [x] **Architecture Improvements**
+  - [x] Implement proper event bus/observer pattern (StateManager with observers)
+  - [x] Separate business logic from UI (MVP architecture - Models, Services, Presenter)
+  - [x] Add dependency injection for testability (IoC container with builder pattern)
+  - [x] Async/await improvements (all services fully async)
 
 ### Performance & Scalability
-- [ ] **Server Performance**
-  - Optimize message routing algorithms
-  - Add connection pooling
-  - Implement message queuing for offline users
-  - Redis integration for distributed state
-  
-- [ ] **Load Testing**
-  - Create load testing suite with Locust/JMeter
-  - Benchmark message throughput
-  - Test concurrent connection limits
-  - Performance monitoring and profiling tools
-
-- [ ] **Monitoring & Observability**
-  - Prometheus metrics endpoint
-  - Grafana dashboards for server stats
-  - Structured logging (JSON format)
-  - Health check endpoints
+- [x] **Server Performance**
+  - [x] Optimize message routing algorithms (routing cache with 70-90% hit rate)
+  - [x] Add connection pooling (ConnectionManager with limits and idle cleanup)
+  - [x] Implement message queuing for offline users (persistent message queue with TTL)
+  - [x] Performance monitoring (PerformanceMonitor tracking message rates and throughput)
 
 ### User Experience
 
 #### GUI Improvements
 - [ ] **Enhanced GUI Client**
-  - Notification system (desktop notifications)
-  - Sound alerts for messages
-  - System tray integration
-  - Emoji picker and reactions
-  - Message formatting (bold, italic, code blocks)
-  - Markdown rendering support
-  - Link previews
-  - Dark/light mode toggle
+  - [x] Notification system (desktop notifications)
+  - [x] Sound alerts for messages
+  - [x] System tray integration
+  - [x] Emoji picker and reactions
+  - [x] Message formatting (bold, italic, code blocks)
+  - [x] Markdown rendering support
+  - [x] Link previews
+  - [ ] Dark/light mode toggle
   
 - [ ] **Accessibility**
   - Screen reader support
@@ -148,6 +136,20 @@ This document outlines planned improvements and future development for JustIRC. 
 ---
 
 ## 🔧 Stability & Polish (v1.3.0)
+
+### Performance & Operations
+
+- [ ] **Load Testing**
+  - Create load testing suite with Locust/JMeter
+  - Benchmark message throughput
+  - Test concurrent connection limits
+  - Performance monitoring and profiling tools
+
+- [ ] **Monitoring & Observability**
+  - Prometheus metrics endpoint
+  - Grafana dashboards for server stats
+  - Structured logging (JSON format)
+  - Health check endpoints
 
 ### Advanced Cryptography
 - [ ] **Post-Quantum Cryptography**

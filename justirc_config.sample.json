@@ -106,14 +106,25 @@
     "show_join_leave": true,
     "sound_notifications": false,
     "compact_mode": false,
-    "inactivity_timeout": 3600
+    "inactivity_timeout": 3600,
+    "enable_system_tray": true,
+    "minimize_to_tray_on_close": true
   },
   "server": {
     "last_server": "localhost",
     "last_port": "6667",
-    "last_nickname": ""  },
+    "last_nickname": ""  
+  },
   "history": {
     "enabled": false,
     "encrypted": false,
-    "password": null  }
+    "password": null
+  },
+  "notifications": {
+    "enabled": true,
+    "on_mention": true,
+    "on_pm": true,
+    "only_when_inactive": true,
+    "sound_enabled": true
+  }
 }

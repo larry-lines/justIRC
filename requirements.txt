@@ -4,6 +4,9 @@ cryptography>=42.0.0
 # Image handling (for image transfer feature)
 Pillow>=10.0.0
 
+# System tray integration (optional)
+pystray>=0.19.0
+
 # CLI interface (for colored terminal output)
 colorama>=0.4.6
 

@@ -150,7 +150,7 @@ class TestChannelCrypto(unittest.TestCase):
         key = self.crypto.create_channel_key(channel)
         
         # Second user loads the same key
-        crypto2 = ChannelCrypto()
+        crypto2 = CryptoLayer()
         crypto2.load_channel_key(channel, key)
         
         # First user encrypts

@@ -45,7 +45,6 @@ class IRCClient:
         
         # Cryptography
         self.crypto = CryptoLayer()
-        self.channel_crypto = ChannelCrypto()
         
         # Image transfers
         self.image_transfer = ImageTransfer(self.crypto)

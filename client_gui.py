@@ -1,6 +1,7 @@
 """
-JustIRC GUI Client - Secure IRC Client with GUI
+JustIRC GUI Client - Secure IRC Client with GUI (MVP Architecture)
 Uses Tkinter for cross-platform GUI
+Refactored to use Model-View-Presenter pattern with dependency injection
 """
 
 import asyncio
@@ -12,15 +13,30 @@ import os
 import time
 from datetime import datetime
 from typing import Optional
+
+# Protocol and crypto
 from protocol import Protocol, MessageType
 from crypto_layer import CryptoLayer
 from image_transfer import ImageTransfer
+
+# Configuration and utilities
 from config_manager import ConfigManager
 from message_history import MessageHistory
+from message_formatter import MessageFormatter
+from system_tray_manager import SystemTrayManager
+from ui_dialogs import UIDialogs
+from command_handler import CommandHandler
+from settings_dialogs import SettingsDialogs
+
+# MVP Architecture (v1.2.0)
+from dependency_container import create_default_container
+from presenter import ClientPresenter
+from models import User, Channel, Message, ClientState, UserStatus, MessageType as ModelMessageType
+from services import NetworkService
 
 
 class IRCClientGUI:
-    """GUI IRC Client with E2E encryption"""
+    """GUI IRC Client with E2E encryption (MVP Architecture)"""
     
     def __init__(self, root):
         self.root = root
@@ -30,17 +46,23 @@ class IRCClientGUI:
         # Load configuration
         self.config = ConfigManager()
         
-        # Client state
+        # Initialize MVP architecture with dependency injection
+        self.container = create_default_container(self.config)
+        self.presenter: ClientPresenter = self.container.resolve(ClientPresenter)
+        
+        # Connect presenter callbacks to UI update methods
+        self._setup_presenter_callbacks()
+        
+        # Legacy support - these will be phased out as we use presenter
+        self.crypto = self.container.resolve(CryptoLayer)
+        self.image_transfer = self.container.resolve(ImageTransfer)
+        self.formatter = MessageFormatter()
+        
+        # LEGACY STATE: Still used by handle_message() - TODO: migrate to presenter/state_manager
         self.connected = False
         self.user_id: Optional[str] = None
         self.nickname: Optional[str] = None
-        self.crypto = CryptoLayer()
-        self.image_transfer = ImageTransfer(self.crypto)
-        
-        self.reader: Optional[asyncio.StreamReader] = None
-        self.writer: Optional[asyncio.StreamWriter] = None
-        
-        self.users = {}  # All users: user_id -> {nickname, public_key}
+        self.users = {}  # All users: user_id -> {nickname, public_key, status, status_message}
         self.channel_users = {}  # Users in current channel: channel -> set(user_ids)
         self.channel_operators = {}  # Channel operators: channel -> set(operator_user_ids)
         self.channel_mods = {}  # Channel mods: channel -> set(mod_user_ids)
@@ -49,9 +71,20 @@ class IRCClientGUI:
         self.current_channel: Optional[str] = None
         self.current_recipient: Optional[str] = None  # For private messages
         self.joined_channels = set()
+        self.blocked_users = set()  # Set of blocked user_ids
+        self.current_status = "online"  # online, away, busy, dnd
+        self.current_status_message = ""
         
-        # Pending image transfers waiting for user acceptance
-        self.pending_images = {}  # image_id -> {from_id, metadata, chunks_data}
+        # UI state (not business state - that's in presenter/state_manager)
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
+        
+        # Legacy state properties - now backed by presenter's state
+        # These provide backward compatibility during refactoring
+        self._legacy_compat_setup()
+        
+        # Pending image transfers (still handled at UI level for now)
+        self.pending_images = {}
         
         # Message history (optional)
         self.history = None
@@ -70,6 +103,253 @@ class IRCClientGUI:
         self.setup_window_icon()
         self.setup_ui()
         self.apply_theme()
+        
+        # System tray setup
+        self.tray_manager = SystemTrayManager(
+            self.root, 
+            self.show_window, 
+            self.hide_window, 
+            self.quit_app
+        )
+        if self.tray_manager.is_available() and self.config.get("ui", "enable_system_tray", default=True):
+            self.tray_manager.setup()
+            self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        
+        # Command handler
+        self.command_handler = CommandHandler(self)
+    
+    def _setup_presenter_callbacks(self):
+        """Connect presenter callbacks to UI update methods"""
+        self.presenter.on_connection_changed = self._on_connection_changed
+        self.presenter.on_message_received = self._on_message_received
+        self.presenter.on_user_list_updated = self._on_user_list_updated
+        self.presenter.on_channel_joined = self._on_channel_joined
+        self.presenter.on_channel_left = self._on_channel_left
+        self.presenter.on_error = self._on_error
+        self.presenter.on_state_changed = self._on_state_changed
+        
+        # Register handle_message as a message handler with NetworkService
+        # This allows the existing comprehensive message handling to continue working
+        # TODO: Gradually migrate individual message types to service-level handling
+        self.presenter.network.add_message_handler(self.handle_message)
+    
+    def _legacy_compat_setup(self):
+        """Set up legacy compatibility properties that delegate to presenter state"""
+        # NOTE: Most legacy state is kept as instance variables for now (see __init__)
+        # because handle_message() still modifies them directly
+        # As we migrate handle_message(), we can remove these and use properties instead
+        pass
+    
+    # COMMENTED OUT: These properties conflict with instance variables
+    # Uncomment and use these once handle_message() is fully refactored
+    
+    # @property
+    # def connected(self) -> bool:
+    #     """Legacy property - delegates to presenter state"""
+    #     return self.presenter.get_state().connected
+    # 
+    # @connected.setter
+    # def connected(self, value: bool):
+    #     """Legacy property setter - updates through presenter"""
+    #     pass  # State is managed by presenter now
+    # 
+    # @property
+    # def user_id(self) -> Optional[str]:
+    #     """Legacy property - delegates to presenter state"""
+    #     return self.presenter.get_state().user_id
+    # 
+    # @property
+    # def nickname(self) -> Optional[str]:
+    #     """Legacy property - delegates to presenter state"""
+    #     return self.presenter.get_state().nickname
+    # 
+    # @property
+    # def users(self) -> dict:
+    #     """Legacy property - delegates to presenter state"""
+    #     return {user.user_id: {
+    #         'nickname': user.nickname,
+    #         'public_key': user.public_key,
+    #         'status': user.status.value,
+    #         'status_message': user.status_message
+    #     } for user in self.presenter.get_users()}
+    # 
+    # @property
+    # def current_channel(self) -> Optional[str]:
+    #     """Legacy property - delegates to presenter state"""
+    #     return self.presenter.get_state().current_channel
+    # 
+    # @property
+    # def joined_channels(self) -> set:
+    #     """Legacy property - delegates to presenter state"""
+    #     return self.presenter.get_state().joined_channels
+    # 
+    # @property
+    # def blocked_users(self) -> set:
+    #     """Legacy property - delegates to presenter state"""
+    #     return self.presenter.get_state().blocked_users
+    
+    # Presenter callback implementations (UI updates)
+    def _on_connection_changed(self, success: bool, error: str):
+        """Called when connection state changes"""
+        if success:
+            self.root.after(0, lambda: self._update_connection_status(True))
+        else:
+            self.root.after(0, lambda: self.log(f"Connection failed: {error}", "error"))
+            self.root.after(0, self._on_disconnected)
+    
+    def _on_message_received(self, message: Message):
+        """Called when a message is received"""
+        self.root.after(0, lambda: self._display_message(message))
+    
+    def _on_user_list_updated(self, users: list[User]):
+        """Called when user list changes"""
+        self.root.after(0, lambda: self._update_user_list())
+    
+    def _on_channel_joined(self, channel: Channel):
+        """Called when successfully joined a channel"""
+        self.root.after(0, lambda: self._handle_channel_joined(channel))
+    
+    def _on_channel_left(self, channel_name: str):
+        """Called when successfully left a channel"""
+        self.root.after(0, lambda: self._handle_channel_left(channel_name))
+    
+    def _on_error(self, error_message: str):
+        """Called when an error occurs"""
+        # Check for special creator password error
+        if error_message.startswith("CREATOR_PASSWORD_REQUIRED:"):
+            actual_error = error_message.split(":", 1)[1]
+            self.root.after(0, lambda: self._show_creator_password_dialog(actual_error))
+        else:
+            # Check if user is banned from a channel - remove from saved channels
+            if "You are banned from" in error_message:
+                # Extract channel name from "You are banned from {channel}"
+                parts = error_message.split("You are banned from")
+                if len(parts) > 1:
+                    channel = parts[1].strip()
+                    self._remove_channel_from_config(channel)
+                    self.root.after(0, lambda: self.log(f"Removed {channel} from saved channels (banned)", "info"))
+            
+            self.root.after(0, lambda: self.log(f"Error: {error_message}", "error"))
+    
+    def _on_state_changed(self, state: ClientState):
+        """Called when application state changes"""
+        self.root.after(0, lambda: self.update_context_label())
+    
+    # UI update helper methods
+    def _update_connection_status(self, connected: bool):
+        """Update UI based on connection status"""
+        # Update legacy state for backward compatibility
+        self.connected = connected
+        
+        if connected:
+            self.connect_btn.config(text="Disconnect", command=self.disconnect, state=tk.NORMAL)
+            self.set_status("Connected")
+            self.log("✓ Connected to server", "success")
+            # Update channel list to show saved channels
+            self._update_channel_list()
+        else:
+            self.connect_btn.config(text="Connect", command=self.connect, state=tk.NORMAL)
+            self.set_status("Disconnected")
+            # Don't log here - let _cleanup_after_disconnect handle it
+    
+    def _display_message(self, message: Message):
+        """Display a received message in the UI"""
+        # Extract sender_id from metadata if available
+        sender_id = message.metadata.get('from_id') if message.metadata else None
+        
+        # Use existing log_chat method for consistent formatting
+        if message.message_type == ModelMessageType.PRIVATE:
+            self.log_chat(message.sender, message.content, msg_type="privmsg", sender_id=sender_id)
+        elif message.message_type == ModelMessageType.CHANNEL:
+            self.log_chat(message.sender, message.content, 
+                         channel=message.recipient, msg_type="msg", sender_id=sender_id)
+        else:
+            self.log(f"{message.sender}: {message.content}")
+    
+    def _handle_channel_joined(self, channel: Channel):
+        """Handle successful channel join"""
+        # Update legacy current_channel for backward compatibility
+        self.current_channel = channel.name
+        
+        # Update legacy joined_channels set
+        self.joined_channels.add(channel.name)
+        
+        # Track if channel is password-protected
+        if channel.password_protected:
+            self.protected_channels.add(channel.name)
+        
+        # Initialize channel data structures
+        if channel.name not in self.channel_users:
+            self.channel_users[channel.name] = set()
+        if channel.name not in self.channel_operators:
+            self.channel_operators[channel.name] = set()
+        if channel.name not in self.channel_mods:
+            self.channel_mods[channel.name] = set()
+        
+        # Populate member data from channel object and sync users dict
+        for member_id in channel.members:
+            self.channel_users[channel.name].add(member_id)
+            
+            # Sync user info from state manager to legacy users dict
+            user = self.presenter.state.get_user(member_id)
+            if user and member_id not in self.users:
+                self.users[member_id] = {
+                    'nickname': user.nickname,
+                    'public_key': user.public_key,
+                    'status': user.status.value if hasattr(user.status, 'value') else str(user.status),
+                    'status_message': user.status_message
+                }
+        
+        # Populate operator/mod data
+        for op_id in channel.operators:
+            self.channel_operators[channel.name].add(op_id)
+        for mod_id in channel.mods:
+            self.channel_mods[channel.name].add(mod_id)
+        
+        # Track owner
+        if channel.owner:
+            self.channel_owners[channel.name] = channel.owner
+        
+        # Also update state manager to ensure consistency
+        self.presenter.state.update_state(current_channel=channel.name)
+        
+        # Save channel to config for persistent rejoining
+        self._save_channel_to_config(channel.name)
+        
+        self.log(f"✓ Joined {channel.name} ({len(channel.members)} members)", "success")
+        self._update_channel_list()
+        self._update_channel_user_list()
+        self.update_context_label()
+    
+    def _handle_channel_left(self, channel_name: str):
+        """Handle leaving a channel"""
+        # Remove from legacy joined_channels set
+        self.joined_channels.discard(channel_name)
+        
+        # Clear channel data structures
+        if channel_name in self.channel_users:
+            del self.channel_users[channel_name]
+        if channel_name in self.channel_operators:
+            del self.channel_operators[channel_name]
+        if channel_name in self.channel_mods:
+            del self.channel_mods[channel_name]
+        if channel_name in self.channel_owners:
+            del self.channel_owners[channel_name]
+        if channel_name in self.protected_channels:
+            self.protected_channels.discard(channel_name)
+        
+        # If this was the current channel, clear it
+        if self.current_channel == channel_name:
+            self.current_channel = None
+            self._update_channel_user_list()  # Clear the user list
+        
+        # Remove channel from saved config
+        self._remove_channel_from_config(channel_name)
+        
+        # Update UI
+        self._update_channel_list()
+        self.update_context_label()
+        self.log(f"Left {channel_name}", "info")
     
     def setup_window_icon(self):
         """Set window icon from PNG file"""
@@ -110,6 +390,176 @@ class IRCClientGUI:
             print(f"Warning: Could not load window icon: {e}")
             pass
     
+    def show_notification(self, title, message):
+        """Show desktop notification - cross-platform implementation"""
+        # Check if notifications are enabled
+        if not self.config.get("notifications", "enabled", default=True):
+            return
+        
+        # Check if only notify when inactive
+        if self.config.get("notifications", "only_when_inactive", default=True):
+            # Check if window is focused
+            try:
+                if self.root.focus_displayof() is not None:
+                    return  # Window has focus, don't notify
+            except:
+                pass  # If check fails, show notification anyway
+        
+        import platform
+        import subprocess
+        
+        system = platform.system()
+        
+        try:
+            if system == "Linux":
+                # Use notify-send on Linux
+                subprocess.run([
+                    'notify-send',
+                    '-a', 'JustIRC',
+                    '-i', 'dialog-information',
+                    title,
+                    message
+                ], check=False)
+            elif system == "Darwin":  # macOS
+                # Use osascript for macOS notifications
+                script = f'display notification "{message}" with title "{title}"'
+                subprocess.run(['osascript', '-e', script], check=False)
+            elif system == "Windows":
+                # Use PowerShell for Windows 10+ toast notifications
+                ps_script = f'''
+                [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+                [Windows.UI.Notifications.ToastNotification, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+                [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+                
+                $template = @"
+                <toast>
+                    <visual>
+                        <binding template="ToastText02">
+                            <text id="1">{title}</text>
+                            <text id="2">{message}</text>
+                        </binding>
+                    </visual>
+                </toast>
+"@
+                
+                $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+                $xml.LoadXml($template)
+                $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+                [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("JustIRC").Show($toast)
+                '''
+                subprocess.run(['powershell', '-Command', ps_script], check=False, capture_output=True)
+        except Exception as e:
+            # Fallback: flash window and make sound
+            try:
+                self.root.bell()
+                # Flash the window title
+                original_title = self.root.title()
+                self.root.title(f"💬 {title}")
+                self.root.after(2000, lambda: self.root.title(original_title))
+            except:
+                pass
+    
+    def block_user(self, user_id: str):
+        """Block a user (client-side filter) - Uses presenter"""
+        asyncio.run_coroutine_threadsafe(
+            self.presenter.block_user(user_id),
+            self.loop
+        )
+        
+        # Get nickname for logging
+        users_dict = self.users
+        nickname = users_dict.get(user_id, {}).get('nickname', user_id)
+        self.log(f"Blocked user: {nickname}", "info")
+    
+    def unblock_user(self, user_id: str):
+        """Unblock a user - Uses presenter"""
+        asyncio.run_coroutine_threadsafe(
+            self.presenter.unblock_user(user_id),
+            self.loop
+        )
+        
+        # Get nickname for logging
+        users_dict = self.users
+        nickname = users_dict.get(user_id, {}).get('nickname', user_id)
+        self.log(f"Unblocked user: {nickname}", "info")
+    
+    def is_user_blocked(self, user_id: str) -> bool:
+        """Check if a user is blocked - Uses presenter state"""
+        return user_id in self.blocked_users
+    
+    def _handle_profile_response(self, message: dict):
+        """Handle profile response from server"""
+        nickname = message.get('nickname', 'Unknown')
+        bio = message.get('bio')
+        status_message = message.get('status_message')
+        registered = message.get('registered', False)
+        registration_date = message.get('registration_date')
+        
+        # Build profile display text
+        profile_text = f"\n{'='*50}\n"
+        profile_text += f"  Profile: {nickname}\n"
+        profile_text += f"{'='*50}\n"
+        
+        if registered:
+            profile_text += f"  ✓ Registered nickname\n"
+            if registration_date:
+                try:
+                    # Format the date nicely
+                    from datetime import datetime
+                    reg_dt = datetime.fromisoformat(registration_date.replace('Z', '+00:00'))
+                    profile_text += f"  Registered: {reg_dt.strftime('%Y-%m-%d')}\n"
+                except Exception:
+                    pass
+        else:
+            profile_text += f"  Unregistered nickname\n"
+        
+        if status_message:
+            profile_text += f"  Status: {status_message}\n"
+        
+        if bio:
+            profile_text += f"\n  Bio:\n"
+            # Indent the bio text
+            for line in bio.split('\n'):
+                profile_text += f"    {line}\n"
+        else:
+            profile_text += f"  No bio set\n"
+        
+        profile_text += f"{'='*50}\n"
+        
+        self.root.after(0, lambda: self.log(profile_text, "info"))
+
+    
+    
+    def show_window(self, icon=None, item=None):
+        """Show the main window from system tray"""
+        self.root.after(0, self._show_window_impl)
+    
+    def _show_window_impl(self):
+        """Implementation of show_window on main thread"""
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+    
+    def hide_window(self, icon=None, item=None):
+        """Hide the main window to system tray"""
+        self.root.after(0, self.root.withdraw)
+    
+    def on_closing(self):
+        """Handle window close event - minimize to tray or quit"""
+        if self.tray_manager.is_available() and self.config.get("ui", "minimize_to_tray_on_close", default=True):
+            # Minimize to tray
+            self.hide_window()
+        else:
+            # Actually quit
+            self.quit_app()
+    
+    def quit_app(self, icon=None, item=None):
+        """Quit the application completely"""
+        self.running = False
+        if self.tray_manager:
+            self.tray_manager.stop()
+        self.root.after(0, self.root.quit)
+    
     def setup_ui(self):
         """Setup the user interface with modern design"""
         # Configure styles
@@ -123,6 +573,8 @@ class IRCClientGUI:
         # File menu
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Set Status...", command=lambda: UIDialogs.show_status_dialog(self.root, self.config, self.send_status))
+        file_menu.add_separator()
         file_menu.add_command(label="Settings", command=self.show_settings)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
@@ -131,7 +583,7 @@ class IRCClientGUI:
         help_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="Help", menu=help_menu)
         help_menu.add_command(label="Commands", command=self.show_help)
-        help_menu.add_command(label="About", command=self.show_about)
+        help_menu.add_command(label="About", command=lambda: UIDialogs.show_about(self.root, self.config))
         
         # Main Container
         main_container = ttk.Frame(self.root)
@@ -172,8 +624,6 @@ class IRCClientGUI:
         btn_frame.pack(side=tk.LEFT)
         self.connect_btn = ttk.Button(btn_frame, text="Connect", command=self.connect, width=10, style='Action.TButton')
         self.connect_btn.pack(side=tk.LEFT, padx=5)
-        self.disconnect_btn = ttk.Button(btn_frame, text="Disconnect", command=self.disconnect, state=tk.DISABLED, width=10)
-        self.disconnect_btn.pack(side=tk.LEFT)
 
         # Main Content Area
         self.content_frame = ttk.Frame(main_container)
@@ -208,6 +658,8 @@ class IRCClientGUI:
         self.channel_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
         self.channel_list.bind('<<ListboxSelect>>', self.on_channel_select)
+        self.channel_list.bind('<Double-Button-1>', self.on_channel_double_click)
+        self.channel_list.bind('<Button-3>', self.on_channel_right_click)
         
         # Channel Controls
         c_btn_frame = ttk.Frame(left_panel)
@@ -265,6 +717,8 @@ class IRCClientGUI:
         
         send_btn = ttk.Button(input_container, text="SEND", command=self.send_message, style='Action.TButton')
         send_btn.pack(side=tk.LEFT)
+        emoji_btn = ttk.Button(input_container, text="😊", command=lambda: UIDialogs.show_emoji_picker(self.root, self.config, self.message_entry), width=3)
+        emoji_btn.pack(side=tk.LEFT, padx=(5, 0))
         img_btn = ttk.Button(input_container, text="📎", command=self.send_image_dialog, width=3)
         img_btn.pack(side=tk.LEFT, padx=(5, 0))
         
@@ -400,6 +854,14 @@ class IRCClientGUI:
         self.chat_display.tag_config("action", foreground=colors["action"], font=('Consolas', 10, 'italic'))
         self.chat_display.tag_config("highlight", background=colors["highlight"])
         self.chat_display.tag_config("self_msg", foreground=fg) # Regular msg color
+        self.chat_display.tag_config("mention", foreground=colors["accent"], font=('Consolas', 10, 'bold'))  # @mentions
+        self.chat_display.tag_config("mention_self", foreground=colors["error"], background=colors["highlight"], font=('Consolas', 10, 'bold'))  # @you mentions
+        
+        # Message formatting tags
+        self.chat_display.tag_config("format_bold", font=('Consolas', 10, 'bold'))
+        self.chat_display.tag_config("format_italic", font=('Consolas', 10, 'italic'))
+        self.chat_display.tag_config("format_code", foreground=colors["info"], background=colors["highlight"], font=('Consolas', 9))
+        self.chat_display.tag_config("format_strike", overstrike=True)
         
         # Configure dynamic tags for name colors
         # (This is done dynamically in log method, but base config here)
@@ -462,417 +924,90 @@ class IRCClientGUI:
     
     def show_settings(self):
         """Show settings dialog"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("Settings")
-        dialog.geometry("450x500")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        
-        # Apply theme colors
-        colors = self.config.get_theme_colors()
-        dialog.config(bg=colors['bg'])
-        
-        notebook = ttk.Notebook(dialog)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        # Theme tab
-        theme_frame = ttk.Frame(notebook, padding=20)
-        notebook.add(theme_frame, text="Theme")
-        
-        ttk.Label(theme_frame, text="Select Theme:", font=('Segoe UI', 10, 'bold')).pack(anchor=tk.W, pady=(0, 10))
-        
-        current_theme = self.config.get("theme", default="dark")
-        theme_var = tk.StringVar(value=current_theme)
-        
-        theme_descriptions = {
-            "dark": "Dark - Classic dark mode",
-            "light": "Light - Bright clean interface",
-            "classic": "Classic - Traditional IRC look",
-            "cyber": "🛡️ Cyber - Security-themed",
-            "custom": "🎨 Custom - User defined colors"
-        }
-        
-        for theme_name in ["dark", "light", "classic", "cyber", "custom"]:
-            ttk.Radiobutton(
-                theme_frame,
-                text=theme_descriptions[theme_name],
-                variable=theme_var,
-                value=theme_name
-            ).pack(anchor=tk.W, pady=5)
-            
-        # Custom Colors Button (Only shown/enabled if custom selected)
-        def convert_color(prompt_title, initial_color):
-            try:
-                from tkinter.colorchooser import askcolor
-                color = askcolor(color=initial_color, title=prompt_title)
-                return color[1] if color[1] else initial_color
-            except:
-                return initial_color
-
-        def open_custom_theme_editor():
-            if theme_var.get() != 'custom':
-                messagebox.showinfo("Info", "Select 'Custom' theme first to edit colors.")
-                return
-                
-            editor = tk.Toplevel(dialog)
-            editor.title("Custom Theme Editor")
-            editor.geometry("400x500")
-            editor.config(bg=colors['bg'])
-            
-            # Load current custom colors
-            current_custom = self.config.get("colors", "custom")
-            if not current_custom:
-                current_custom = self.config.get("colors", "dark").copy() # fallback
-            
-            # Helper to create color picker row
-            def create_picker(parent, name, key):
-                f = ttk.Frame(parent)
-                f.pack(fill=tk.X, pady=2)
-                ttk.Label(f, text=name, width=20).pack(side=tk.LEFT)
-                
-                # Color preview/button
-                btn = tk.Button(f, bg=current_custom.get(key, '#000000'), width=10)
-                
-                def pick():
-                    new_c = convert_color(f"Pick {name}", current_custom.get(key, '#000000'))
-                    current_custom[key] = new_c
-                    btn.config(bg=new_c)
-                    
-                btn.config(command=pick)
-                btn.pack(side=tk.RIGHT)
-                
-            scroll_frame = ttk.Frame(editor)
-            scroll_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-            
-            keys_to_edit = [
-                ("Background", "bg"), ("Foreground", "fg"),
-                ("Chat BG", "chat_bg"), ("Chat FG", "chat_fg"),
-                ("Accent", "accent"), ("Input BG", "input_bg"),
-                ("Info Text", "info"), ("Error Text", "error"),
-                ("Success Text", "success")
-            ]
-            
-            for label, key in keys_to_edit:
-                create_picker(scroll_frame, label, key)
-                
-            def save_custom():
-                self.config.set("colors", "custom", value=current_custom)
-                messagebox.showinfo("Saved", "Custom colors saved. Apply theme to see changes.")
-                editor.destroy()
-                
-            ttk.Button(editor, text="Save Custom Colors", command=save_custom).pack(pady=10)
-
-        editor_btn = ttk.Button(theme_frame, text="Customize Colors...", command=open_custom_theme_editor)
-        editor_btn.pack(anchor=tk.W, pady=10)
-        
-        # Font tab
-        font_frame = ttk.Frame(notebook, padding=20)
-        notebook.add(font_frame, text="Font")
-        
-        ttk.Label(font_frame, text="Font Family:", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(0, 5))
-        font_family_var = tk.StringVar(value=self.config.get("font", "family", default="Consolas"))
-        font_entry = ttk.Entry(font_frame, textvariable=font_family_var, width=30)
-        font_entry.pack(anchor=tk.W, pady=(0, 15))
-        
-        ttk.Label(font_frame, text="Chat Font Size:", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(0, 5))
-        font_size_var = tk.IntVar(value=self.config.get("font", "chat_size", default=10))
-        ttk.Scale(
-            font_frame,
-            from_=8,
-            to=16,
-            variable=font_size_var,
-            orient=tk.HORIZONTAL,
-            length=200
-        ).pack(anchor=tk.W)
-        
-        # UI Options tab
-        ui_frame = ttk.Frame(notebook, padding=20)
-        notebook.add(ui_frame, text="UI Options")
-        
-        timestamps_var = tk.BooleanVar(value=self.config.get("ui", "show_timestamps", default=True))
-        join_leave_var = tk.BooleanVar(value=self.config.get("ui", "show_join_leave", default=True))
-        
-        ttk.Checkbutton(ui_frame, text="Show timestamps", variable=timestamps_var).pack(anchor=tk.W, pady=5)
-        ttk.Checkbutton(ui_frame, text="Show join/leave messages", variable=join_leave_var).pack(anchor=tk.W, pady=5)
-        
-        ttk.Label(ui_frame, text="Inactivity Timeout (minutes):", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(15, 5))
-        timeout_var = tk.IntVar(value=self.config.get("ui", "inactivity_timeout", default=3600) // 60)
-        timeout_frame = ttk.Frame(ui_frame)
-        timeout_frame.pack(anchor=tk.W)
-        ttk.Scale(
-            timeout_frame,
-            from_=1,
-            to=120,
-            variable=timeout_var,
-            orient=tk.HORIZONTAL,
-            length=200
-        ).pack(side=tk.LEFT)
-        timeout_label = ttk.Label(timeout_frame, text=f"{timeout_var.get()} min")
-        timeout_label.pack(side=tk.LEFT, padx=10)
-        
-        def update_timeout_label(*args):
-            timeout_label.config(text=f"{timeout_var.get()} min")
-        timeout_var.trace('w', update_timeout_label)
-        
-        # History tab
-        history_frame = ttk.Frame(notebook, padding=20)
-        notebook.add(history_frame, text="History")
-        
-        ttk.Label(history_frame, text="Message History:", font=('Arial', 10, 'bold')).pack(anchor=tk.W, pady=(0, 10))
-        
-        history_enabled_var = tk.BooleanVar(value=self.config.get("history", "enabled", default=False))
-        history_encrypted_var = tk.BooleanVar(value=self.config.get("history", "encrypted", default=False))
-        
-        ttk.Checkbutton(history_frame, text="Enable message history", variable=history_enabled_var).pack(anchor=tk.W, pady=5)
-        ttk.Checkbutton(history_frame, text="Encrypt history (requires password)", variable=history_encrypted_var).pack(anchor=tk.W, pady=5)
-        
-        ttk.Label(history_frame, text="History password (optional):", font=('Arial', 9)).pack(anchor=tk.W, pady=(10, 5))
-        history_password_var = tk.StringVar(value=self.config.get("history", "password", default=""))
-        history_password_entry = ttk.Entry(history_frame, textvariable=history_password_var, show="*", width=30)
-        history_password_entry.pack(anchor=tk.W)
-        
-        ttk.Label(
-            history_frame, 
-            text="Note: Restart required for history changes to take effect.",
-            font=('Arial', 8, 'italic'),
-            foreground="gray"
-        ).pack(anchor=tk.W, pady=(10, 0))
-        
-        # Show history stats if enabled
-        if self.history:
-            stats = self.history.get_statistics()
-            stats_text = f"\nCurrent History Stats:\n"
-            stats_text += f"  • Total messages: {stats['total_messages']}\n"
-            stats_text += f"  • Total channels: {stats['total_channels']}\n"
-            if stats['oldest_message']:
-                stats_text += f"  • Oldest message: {stats['oldest_message'].strftime('%Y-%m-%d %H:%M')}\n"
-            if stats['newest_message']:
-                stats_text += f"  • Newest message: {stats['newest_message'].strftime('%Y-%m-%d %H:%M')}\n"
-            stats_text += f"  • Encrypted: {'Yes' if stats['encrypted'] else 'No'}"
-            
-            ttk.Label(history_frame, text=stats_text, font=('Arial', 9)).pack(anchor=tk.W, pady=(10, 0))
-            
-            # Clear history button
-            def clear_history():
-                if messagebox.askyesno("Clear History", "Are you sure you want to clear all message history? This cannot be undone."):
-                    self.history.clear_history()
-                    messagebox.showinfo("Success", "Message history cleared")
-            
-            ttk.Button(history_frame, text="Clear All History", command=clear_history).pack(anchor=tk.W, pady=(10, 0))
-        
-        # Buttons
-        btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(fill=tk.X, padx=10, pady=10)
-        
-        def save_settings():
-            self.config.set("theme", value=theme_var.get())
-            self.config.set("font", "family", value=font_family_var.get())
-            self.config.set("font", "chat_size", value=font_size_var.get())
-            self.config.set("ui", "show_timestamps", value=timestamps_var.get())
-            self.config.set("ui", "show_join_leave", value=join_leave_var.get())
-            self.config.set("ui", "inactivity_timeout", value=timeout_var.get() * 60)
-            self.config.set("history", "enabled", value=history_enabled_var.get())
-            self.config.set("history", "encrypted", value=history_encrypted_var.get())
-            if history_password_var.get():
-                self.config.set("history", "password", value=history_password_var.get())
-            self.apply_theme()
-            
-            # Update font
-            font_family = font_family_var.get()
-            font_size = font_size_var.get()
-            self.chat_display.config(font=(font_family, font_size))
-            
-            dialog.destroy()
-            dialog.destroy()
-            messagebox.showinfo("Settings", "Settings saved! Some changes may require restart.")
-        
-        ttk.Button(btn_frame, text="Save", command=save_settings, width=12).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy, width=12).pack(side=tk.RIGHT)
+        SettingsDialogs.show_settings(self.root, self.config, self.history, self.chat_display, self.apply_theme)
     
     def show_help(self):
         """Show help dialog with command list"""
-        help_text = """IRC Commands:
-        
-🔹 Basic Commands:
-  /join #channel [join_pwd] [creator_pwd]  - Join/create channel
-    • For new channels: creator_pwd required (4+ chars) to regain operator later
-    • For existing: use creator_pwd to regain operator status  
-    • If only one password: used for both join and creator access
-    • Channel names automatically converted to lowercase
-    • Spaces in names replaced with hyphens
-  /leave [#channel]          - Leave current or specified channel
-  /msg user message          - Send private message
-  /nick newnick              - Change nickname (future)
-  /quit                      - Disconnect and quit
-  
-🔹 Actions & Formatting:
-  /me action                 - Send action (*user does something*)
-  
-🔹 Channel Management:
-  Mods - Can kick users
-  Operators - Can kick, ban, give mod status
-  Owners - All operator powers + give operator status + transfer ownership
-  
-  /op user                   - Grant operator (owner only, requires setting op password)
-  /unop user                 - Remove operator status (owner only)
-  /mod user                  - Grant mod status (operators+)
-  /unmod user                - Remove mod status (operators+)
-  /kick user [reason]        - Kick user from channel (mods+)
-  /ban user [reason]         - Ban user from channel (operators+)
-  /unban user                - Unban user from channel (operators+)
-  /kickban user [reason]     - Kick and ban user (operators+)
-  /transfer user             - Transfer channel ownership (owner only, target must be op)
-  /topic new topic           - Set channel topic (operators+)
-  
-🔹 Information:
-  /users                     - List all online users
-  /whois user                - Get user information and channels
-  /list                      - List all available channels (🔒 = password-protected)
-  
-🔹 Message History (if enabled):
-  /history [limit]           - Show message history (default: 50 messages)
-  /search query              - Search message history
-  /export                    - Export message history to file
-  
-🔹 File Transfer:
-  /image user path           - Send encrypted image
-  
-💡 Tip: Double-click a user to start private chat
-💡 Tip: Right-click a channel user for quick actions
-💡 Tip: Press Tab to autocomplete nicknames
-💡 Tip: Channel messages are filtered - switch channels to see different conversations
-💡 Tip: Operators need a password - set it when granted op, provide it when rejoining
+        help_text = """Available Commands:
+
+Channel Management:
+  /join <channel> [password] [creator_password]
+  /leave or /part - Leave current channel
+  /topic <text> - Set channel topic
+  /list - List all channels
+
+Messaging:
+  /msg <nickname> <message> - Send private message
+  /me <action> - Send action message
+  /image - Send image to user or channel
+
+User Management:
+  /users - List online users
+  /whois <nickname> - Get user info
+  /block <nickname> - Block a user
+  /unblock <nickname> - Unblock a user
+  /blocked - List blocked users
+
+Operator Commands:
+  /op <nickname> - Grant operator status
+  /unop <nickname> - Remove operator status
+  /mod <nickname> - Grant moderator status
+  /unmod <nickname> - Remove moderator status
+  /kick <nickname> [reason] - Kick user from channel
+  /ban <nickname> [duration] [reason] - Ban user
+  /kickban <nickname> [reason] - Kick and ban user
+  /unban <nickname> - Unban user
+  /mode <mode> [args] - Set channel mode
+  /invite <nickname> - Invite user to channel
+  /transfer <nickname> - Transfer ownership
+
+Message History:
+  /history [count] - Show message history
+  /search <query> - Search message history
+  /export <filename> - Export chat history
+
+Other:
+  /register <password> - Register account
+  /profile <nickname> - View user profile
+  /help - Show this help
+  /quit - Disconnect from server
 """
         
+        # Create help dialog
         dialog = tk.Toplevel(self.root)
         dialog.title("IRC Commands Help")
-        dialog.geometry("600x500")
+        dialog.geometry("700x600")
         dialog.transient(self.root)
         
-        # Apply theme colors
+        # Apply theme
         colors = self.config.get_theme_colors()
         dialog.config(bg=colors['bg'])
         
-        text = scrolledtext.ScrolledText(dialog, wrap=tk.WORD, font=('Consolas', 10),
-                                         bg=colors['chat_bg'], fg=colors['chat_fg'])
-        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        text.insert('1.0', help_text)
-        text.config(state=tk.DISABLED)
+        # Create text widget with scrollbar
+        frame = ttk.Frame(dialog)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        ttk.Button(dialog, text="Close", command=dialog.destroy).pack(pady=10)
-    
-    def show_about(self):
-        """Show about dialog with logo"""
-        dialog = tk.Toplevel(self.root)
-        dialog.title("About JustIRC")
-        dialog.geometry("450x550")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        dialog.resizable(False, False)
+        scrollbar = ttk.Scrollbar(frame)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Get theme colors
-        colors = self.config.get_theme_colors()
-        dialog.config(bg=colors['bg'])
-        
-        # Create logo area
-        logo_frame = tk.Frame(dialog, bg=colors['bg'], height=120)
-        logo_frame.pack(fill=tk.X, pady=20)
-        
-        # Create a simple shield logo
-        try:
-            canvas = tk.Canvas(logo_frame, width=100, height=100, 
-                             bg=colors['bg'], highlightthickness=0)
-            canvas.pack()
-            
-            # Draw cyber shield logo
-            # Hexagon/shield shape
-            points = [
-                50, 10,   # Top
-                80, 30,   # Top right
-                80, 70,   # Bottom right
-                50, 90,   # Bottom
-                20, 70,   # Bottom left
-                20, 30    # Top left
-            ]
-            
-            # Gradient effect with multiple polygons
-            canvas.create_polygon(points, fill='#2196F3', outline='#66BB6A', width=3)
-            
-            # Inner design - circuit-like
-            canvas.create_oval(30, 30, 70, 70, outline='#4CAF50', width=2)
-            canvas.create_line(50, 20, 50, 40, fill='#76FF03', width=2)
-            canvas.create_line(50, 60, 50, 80, fill='#76FF03', width=2)
-            canvas.create_line(30, 50, 40, 50, fill='#76FF03', width=2)
-            canvas.create_line(60, 50, 70, 50, fill='#76FF03', width=2)
-            
-            # Center "C"
-            canvas.create_arc(40, 40, 60, 60, start=45, extent=270,
-                            outline='#66BB6A', width=3, style=tk.ARC)
-        except:
-            pass
-        
-        # App title
-        title_label = tk.Label(
-            dialog,
-            text="🛡️ JustIRC",
-            font=('Arial', 24, 'bold'),
-            bg=colors['bg'],
-            fg=colors['accent']
-        )
-        title_label.pack(pady=(0, 10))
-        
-        subtitle_label = tk.Label(
-            dialog,
-            text="Secure Encrypted IRC",
-            font=('Arial', 12),
-            bg=colors['bg'],
-            fg=colors['fg']
-        )
-        subtitle_label.pack(pady=(0, 20))
-        
-        # Info frame
-        info_frame = tk.Frame(dialog, bg=colors['chat_bg'], relief=tk.RIDGE, borderwidth=2)
-        info_frame.pack(fill=tk.BOTH, expand=True, padx=30, pady=10)
-        
-        info_text = (
-            "Version 1.0.1\n\n"
-            "🔐 End-to-End Encrypted IRC Client\n\n"
-            "Features:\n"
-            "  • X25519 ECDH key exchange\n"
-            "  • ChaCha20-Poly1305 AEAD encryption\n"
-            "  • Zero-knowledge routing server\n"
-            "  • Secure image transfer\n"
-            "  • Password-protected channels\n"
-            "  • Channel operators\n"
-            "  • Modern themeable UI\n\n"
-            "🔒 Your messages are encrypted end-to-end.\n"
-            "The server cannot decrypt your communications!"
-        )
-        
-        info_label = tk.Label(
-            info_frame,
-            text=info_text,
-            justify=tk.LEFT,
-            font=('Consolas', 10),
+        text_widget = tk.Text(
+            frame,
+            wrap=tk.WORD,
+            yscrollcommand=scrollbar.set,
             bg=colors['chat_bg'],
-            fg=colors['chat_fg'],
-            padx=20,
-            pady=20
+            fg=colors['fg'],
+            font=('Courier', 10),
+            padx=10,
+            pady=10
         )
-        info_label.pack()
+        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=text_widget.yview)
+        
+        text_widget.insert('1.0', help_text)
+        text_widget.config(state=tk.DISABLED)
         
         # Close button
-        close_btn = tk.Button(
-            dialog,
-            text="Close",
-            command=dialog.destroy,
-            font=('Arial', 10),
-            bg=colors['accent'],
-            fg='white',
-            padx=30,
-            pady=5
-        )
-        close_btn.pack(pady=20)
+        ttk.Button(dialog, text="Close", command=dialog.destroy, width=15).pack(pady=10)
     
     def autocomplete_nickname(self, event):
         """Autocomplete nickname with Tab key"""
@@ -911,11 +1046,13 @@ class IRCClientGUI:
         if not selection:
             return
             
-        # Identify user from list (strip symbol)
+        # Identify user from list - format is "symbol status_icon nickname"
         display_name = self.channel_user_list.get(selection[0])
-        # Simple split by first space to remove symbol
-        parts = display_name.split(' ', 1)
-        nickname = parts[1] if len(parts) > 1 else display_name
+        # Split and take last part (nickname) after removing role symbol and status icon
+        parts = display_name.split()
+        # The nickname is everything after the emojis (last part or parts joined if space in nickname)
+        # Since nicknames can't have spaces in IRC, it's the last part
+        nickname = parts[-1] if parts else display_name
         
         # Create context menu
         menu = tk.Menu(self.root, tearoff=0)
@@ -933,8 +1070,32 @@ class IRCClientGUI:
             if nickname != self.nickname:
                 menu.add_command(label=f"Kick {nickname}", command=lambda: self.kick_user_dialog(nickname))
         
+        # Add block/unblock option
+        if nickname != self.nickname:
+            menu.add_separator()
+            # Find user_id for this nickname
+            user_id = None
+            for uid, info in self.users.items():
+                if info.get('nickname') == nickname:
+                    user_id = uid
+                    break
+            
+            if user_id:
+                if self.is_user_blocked(user_id):
+                    menu.add_command(label=f"❌ Unblock {nickname}", command=lambda: self.unblock_user(user_id))
+                else:
+                    menu.add_command(label=f"🚫 Block {nickname}", command=lambda: self.block_user(user_id))
+        
         # Show menu
         menu.post(event.x_root, event.y_root)
+        
+        # Bind to destroy menu when clicking elsewhere
+        def close_menu(e=None):
+            menu.unpost()
+            self.root.unbind('<Button-1>')
+        
+        self.root.bind('<Button-1>', close_menu)
+        menu.bind('<FocusOut>', close_menu)
     
     def start_pm(self, nickname):
         """Start private message with user"""
@@ -956,10 +1117,22 @@ class IRCClientGUI:
             )
     
     def quick_op_user(self, nickname):
-        """Quick op user with saved password"""
-        # For now, just open the op dialog
-        # In future, could save password securely
-        self.op_user_dialog_for_user(nickname)
+        """Grant operator status to user - server will prompt target for password"""
+        if not self.connected or not self.current_channel:
+            return
+        
+        # Send OP_USER message directly - server will prompt target user for password
+        msg = Protocol.build_message(
+            MessageType.OP_USER,
+            channel=self.current_channel,
+            target_nickname=nickname
+        )
+        asyncio.run_coroutine_threadsafe(
+            self.send_to_server(msg),
+            self.loop
+        )
+        self.log(f"Requesting to grant operator status to {nickname}...", "info")
+    
     
     def op_user_dialog_for_user(self, target_nickname):
         """Show op dialog for specific user - requires operator password"""
@@ -1004,25 +1177,45 @@ class IRCClientGUI:
         # Bind enter key
         password_entry.bind('<Return>', lambda e: grant())
     
-    def _prompt_op_password(self, channel: str, is_new: bool):
-        """Prompt user for operator password"""
+    def _prompt_op_password(self, channel: str, is_new: bool, granted_by: str = None, is_mod: bool = False):
+        """Prompt user for operator/mod password"""
         # Create dialog
         dialog = tk.Toplevel(self.root)
-        dialog.title("Operator Password Required")
-        dialog.geometry("400x180")
+        
+        # Set title based on context
+        if granted_by:
+            role_name = "Moderator" if is_mod else "Operator"
+            dialog.title(f"{role_name} Role Granted")
+        else:
+            dialog.title("Operator Password Required")
+        
+        dialog.geometry("450x200")
         dialog.transient(self.root)
-        dialog.grab_set()
         
         # Apply theme colors
         colors = self.config.get_theme_colors()
         dialog.config(bg=colors['bg'])
         
-        if is_new:
-            prompt_text = f"Set your operator password for {channel} (4+ chars):"
+        # Set prompt text based on context
+        if granted_by:
+            role_name = "moderator" if is_mod else "operator"
+            if is_new:
+                prompt_text = f"{granted_by} has granted you {role_name} status in {channel}"
+                sub_text = f"Set your {role_name} password (4+ chars):"
+            else:
+                prompt_text = f"{granted_by} is granting you {role_name} status in {channel}"
+                sub_text = f"Enter your {role_name} password:"
         else:
-            prompt_text = f"Enter your operator password for {channel}:"
+            if is_new:
+                prompt_text = f"Set your operator password for {channel} (4+ chars):"
+                sub_text = ""
+            else:
+                prompt_text = f"Enter your operator password for {channel}:"
+                sub_text = ""
         
         ttk.Label(dialog, text=prompt_text, font=('Arial', 10, 'bold')).pack(pady=15)
+        if sub_text:
+            ttk.Label(dialog, text=sub_text, font=('Arial', 9)).pack(pady=(0, 10))
         
         password_entry = ttk.Entry(dialog, width=40, show='*')
         password_entry.pack(padx=20, fill=tk.X, pady=5)
@@ -1053,13 +1246,21 @@ class IRCClientGUI:
         
         def cancel():
             dialog.destroy()
-            # User refused to provide password - will be disconnected by server
-            self.log("Operator authentication cancelled - you will be disconnected", "error")
+            # User refused to provide password
+            if granted_by:
+                self.log(f"You declined the {'moderator' if is_mod else 'operator'} role in {channel}", "error")
+            else:
+                self.log("Operator authentication cancelled - you will be disconnected", "error")
         
         ttk.Button(btn_frame, text="Submit", command=submit, width=10).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=cancel, width=10).pack(side=tk.LEFT)
         
         password_entry.bind('<Return>', lambda e: submit())
+        
+        # Ensure dialog is rendered before grabbing focus
+        dialog.update_idletasks()
+        dialog.grab_set()
+    
     
     def kick_user_dialog(self, target_nickname):
         """Show kick user dialog"""
@@ -1100,9 +1301,20 @@ class IRCClientGUI:
         
         reason_entry.bind('<Return>', lambda e: kick())
     
-    def log_chat(self, sender: str, message: str, channel: str = None, msg_type: str = "msg"):
+    def log_chat(self, sender: str, message: str, channel: str = None, msg_type: str = "msg", sender_id: str = None):
         """Add structured chat message with colored nickname"""
         from datetime import datetime
+        
+        # If sender_id not provided, try to look it up
+        if sender_id is None:
+            for uid, info in self.users.items():
+                if info.get('nickname') == sender:
+                    sender_id = uid
+                    break
+        
+        # Check if sender is blocked (client-side filter)
+        if sender_id and self.is_user_blocked(sender_id):
+            return  # Silently ignore messages from blocked users
         
         # Save to history if enabled
         if self.history:
@@ -1127,6 +1339,15 @@ class IRCClientGUI:
         if channel:
             self.chat_display.insert(tk.END, f"[{channel}] ", "channel")
         
+        # Determine sender role and get appropriate symbol
+        role_symbol = ""
+        if sender_id and channel:
+            # Check if user has a role in this channel
+            is_owner = self.channel_owners.get(channel) == sender_id
+            is_op = sender_id in self.channel_operators.get(channel, set())
+            is_mod = sender_id in self.channel_mods.get(channel, set())
+            role_symbol = self.config.get_role_symbol(is_owner=is_owner, is_op=is_op, is_mod=is_mod)
+        
         # Determine sender color and tag
         nick_color = self.config.get_nick_color(sender)
         nick_tag = f"nick_{sender}"
@@ -1135,17 +1356,79 @@ class IRCClientGUI:
         except:
             pass
             
-        # Insert Nickname
+        # Insert Nickname with role symbol
         if msg_type == "action":
             self.chat_display.insert(tk.END, "* ", "action")
+            if role_symbol:
+                self.chat_display.insert(tk.END, f"{role_symbol} ", "role_icon")
             self.chat_display.insert(tk.END, sender, nick_tag)
             self.chat_display.insert(tk.END, f" {message}\n", "action")
         else:
+            if role_symbol:
+                self.chat_display.insert(tk.END, f"{role_symbol} ", "role_icon")
             self.chat_display.insert(tk.END, f"<{sender}> ", nick_tag)
-            self.chat_display.insert(tk.END, f"{message}\n", "self_msg")
+            # Process message for @mentions
+            mentioned_me = self._insert_message_with_mentions(message)
+            
+            # Show notification if user was mentioned
+            if mentioned_me and self.config.get("notifications", "on_mention", default=True):
+                self.show_notification(
+                    f"Mentioned in {channel or 'chat'}",
+                    f"{sender}: {message[:100]}{'...' if len(message) > 100 else ''}"
+                )
             
         self.chat_display.see(tk.END)
         self.chat_display.config(state=tk.DISABLED)
+    
+    def _insert_message_with_mentions(self, message: str):
+        """Insert message text with formatting and highlighted @mentions. Returns True if current user was mentioned."""
+        import re
+        
+        mentioned_me = False
+        
+        # First, split by @mentions
+        mention_pattern = r'(@\w+)'
+        parts = re.split(mention_pattern, message)
+        
+        for part in parts:
+            if part.startswith('@'):
+                # This is a mention
+                username = part[1:]
+                
+                # Check if it's mentioning the current user
+                if self.nickname and username.lower() == self.nickname.lower():
+                    self.chat_display.insert(tk.END, part, "mention_self")
+                    mentioned_me = True
+                else:
+                    self.chat_display.insert(tk.END, part, "mention")
+            else:
+                # Regular text - apply formatting
+                formatted_parts = self.formatter.parse_message(part)
+                
+                for text, fmt in formatted_parts:
+                    if fmt == 'normal':
+                        self.chat_display.insert(tk.END, text, "self_msg")
+                    elif fmt == 'bold':
+                        self.chat_display.insert(tk.END, text, "format_bold")
+                    elif fmt == 'italic':
+                        self.chat_display.insert(tk.END, text, "format_italic")
+                    elif fmt == 'code':
+                        self.chat_display.insert(tk.END, text, "format_code")
+                    elif fmt == 'strikethrough':
+                        self.chat_display.insert(tk.END, text, "format_strike")
+        
+        self.chat_display.insert(tk.END, "\n")
+        
+        # Play sound and show notification if user was mentioned
+        if mentioned_me:
+            # Play sound if enabled
+            if self.config.get("notifications", "sound_enabled", default=True):
+                try:
+                    self.root.bell()
+                except:
+                    pass
+        
+        return mentioned_me
 
     def log(self, message: str, tag: str = None):
         """Add message to chat display"""
@@ -1171,7 +1454,7 @@ class IRCClientGUI:
         self.status_var.set(status)
     
     def connect(self):
-        """Connect to server"""
+        """Connect to server - Uses presenter"""
         server = self.server_entry.get().strip()
         port = self.port_entry.get().strip()
         nickname = self.nick_entry.get().strip()
@@ -1186,34 +1469,65 @@ class IRCClientGUI:
             messagebox.showerror("Error", "Invalid port number")
             return
         
-        self.nickname = nickname
-        
         # Disable connection controls
         self.connect_btn.config(state=tk.DISABLED)
         self.server_entry.config(state=tk.DISABLED)
         self.port_entry.config(state=tk.DISABLED)
         self.nick_entry.config(state=tk.DISABLED)
-        self.disconnect_btn.config(state=tk.NORMAL)
         
-        # Start event loop in thread
-        self.running = True
-        thread = threading.Thread(target=self._run_async_loop, args=(server, port), daemon=True)
-        thread.start()
+        # Setup event loop if needed
+        if self.loop is None:
+            self.running = True
+            thread = threading.Thread(target=self._run_async_loop, args=(server, port, nickname), daemon=True)
+            thread.start()
+        else:
+            # Use existing loop - create ConnectionConfig for presenter
+            from models import ConnectionConfig
+            config = ConnectionConfig(
+                host=server,
+                port=port,
+                nickname=nickname
+            )
+            asyncio.run_coroutine_threadsafe(
+                self.presenter.connect(config),
+                self.loop
+            )
+        
+        # Save last server to config
+        self.config.set("server", "last_server", value=server)
+        self.config.set("server", "last_port", value=str(port))
+        self.config.set("server", "last_nickname", value=nickname)
         
         self.log(f"Connecting to {server}:{port}...", "info")
     
-    def _run_async_loop(self, server: str, port: int):
+    def _run_async_loop(self, server: str, port: int, nickname: str):
         """Run asyncio event loop in thread"""
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         
         try:
-            self.loop.run_until_complete(self._connect_and_run(server, port))
+            self.loop.run_until_complete(self._connect_via_presenter(server, port, nickname))
+            # Keep loop running for async operations
+            self.loop.run_forever()
         except Exception as e:
             self.log(f"Connection error: {e}", "error")
         finally:
             self.loop.close()
             self.running = False
+    
+    async def _connect_via_presenter(self, server: str, port: int, nickname: str):
+        """Connect to server via presenter"""
+        from models import ConnectionConfig
+        try:
+            config = ConnectionConfig(
+                host=server,
+                port=port,
+                nickname=nickname
+            )
+            await self.presenter.connect(config)
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"Connection failed: {e}", "error"))
+            self.root.after(0, self._on_disconnected)
     
     async def _connect_and_run(self, server: str, port: int):
         """Connect to server and run"""
@@ -1265,10 +1579,13 @@ class IRCClientGUI:
             self.root.after(0, self._on_disconnected)
     
     async def send_to_server(self, message: str):
-        """Send message to server"""
-        if self.writer and self.connected:
-            self.writer.write(message.encode('utf-8') + b'\n')
-            await self.writer.drain()
+        """Send message to server - Uses NetworkService"""
+        try:
+            network = self.container.resolve(NetworkService)
+            if network.connected:
+                await network.send(message)
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"Failed to send: {e}", "error"))
     
     async def handle_message(self, message: dict):
         """Handle incoming message"""
@@ -1277,6 +1594,21 @@ class IRCClientGUI:
         if msg_type == MessageType.ACK.value:
             if 'user_id' in message:
                 self.user_id = message['user_id']
+                
+                # Set nickname from state manager (set by presenter during connection)
+                state = self.presenter.state.get_state()
+                if state.nickname:
+                    self.nickname = state.nickname
+                
+                # Add self to users dict for proper role display
+                if self.user_id and self.nickname:
+                    self.users[self.user_id] = {
+                        'nickname': self.nickname,
+                        'public_key': self.crypto.get_public_key_b64(),
+                        'status': 'online',
+                        'status_message': ''
+                    }
+                
                 welcome_msg = message.get('message', 'Registered')
                 self.root.after(0, lambda: self.log(welcome_msg, "success"))
                 
@@ -1286,83 +1618,59 @@ class IRCClientGUI:
                     self.root.after(0, lambda: self.log("\n" + description + "\n", "info"))
             
             elif 'channel' in message:
-                channel = message['channel']
-                self.joined_channels.add(channel)
-                self.current_channel = channel
-                
-                # Track if channel is password-protected
-                if message.get('is_protected', False):
-                    self.protected_channels.add(channel)
-                
-                # Initialize channel users set
-                if channel not in self.channel_users:
-                    self.channel_users[channel] = set()
-                
-                # Initialize channel operators and mods sets
-                if channel not in self.channel_operators:
-                    self.channel_operators[channel] = set()
-                if channel not in self.channel_mods:
-                    self.channel_mods[channel] = set()
-                
-                # Load member keys and track them
-                members = message.get('members', [])
-                for member in members:
-                    member_id = member['user_id']
-                    self.channel_users[channel].add(member_id)
-                    
-                    # Track operator status
-                    if member.get('is_operator', False):
-                        self.channel_operators[channel].add(member_id)
-                    
-                    # Track mod status
-                    if member.get('is_mod', False):
-                        self.channel_mods[channel].add(member_id)
-                    
-                    # Track owner
-                    if member.get('is_owner', False):
-                        self.channel_owners[channel] = member_id
-                    
-                    if member_id != self.user_id:
-                        self.users[member_id] = {
-                            'nickname': member['nickname'],
-                            'public_key': member['public_key']
-                        }
-                        self.crypto.load_peer_public_key(member_id, member['public_key'])
-                    else:
-                        # Add ourselves to users dict if not there
-                        if member_id not in self.users:
-                            self.users[member_id] = {
-                                'nickname': member['nickname'],
-                                'public_key': member['public_key']
-                            }
-                
-                self.root.after(0, self._update_channel_list)
-                self.root.after(0, self._update_channel_user_list)
-                self.root.after(0, self.update_context_label)
-                self.root.after(0, lambda: self.log(f"Joined {channel} ({len(members)} members)", "success"))
-                
-                # Display topic if set
-                topic = message.get('topic', '')
-                if topic:
-                    self.root.after(0, lambda t=topic: self.log(f"Topic: {t}", "info"))
+                # Legacy ACK for channel join - skip as presenter handles JOIN_CHANNEL
+                # Just log for debugging
+                pass
         
         elif msg_type == MessageType.USER_LIST.value:
             users = message.get('users', [])
             for user in users:
                 self.users[user['user_id']] = {
                     'nickname': user['nickname'],
-                    'public_key': user['public_key']
+                    'public_key': user['public_key'],
+                    'status': user.get('status', 'online'),
+                    'status_message': user.get('status_message', '')
                 }
                 self.crypto.load_peer_public_key(user['user_id'], user['public_key'])
             
             self.root.after(0, self._update_user_list)
             self.root.after(0, lambda: self.log(f"{len(users)} users online", "info"))
         
+        elif msg_type == MessageType.STATUS_UPDATE.value:
+            # User status changed
+            user_id = message.get('user_id')
+            nickname = message.get('nickname')
+            status = message.get('status', 'online')
+            status_message = message.get('custom_message', '')
+            
+            if user_id and user_id in self.users:
+                self.users[user_id]['status'] = status
+                self.users[user_id]['status_message'] = status_message
+                
+                # Update UI
+                self.root.after(0, self._update_user_list)
+                self.root.after(0, self._update_channel_user_list)
+                
+                # Log status change
+                status_icons = {'online': '🟢', 'away': '🟡', 'busy': '🔴', 'dnd': '⛔'}
+                icon = status_icons.get(status, '🟢')
+                msg_text = f"{icon} {nickname} is now {status}"
+                if status_message:
+                    msg_text += f": {status_message}"
+                self.root.after(0, lambda: self.log(msg_text, "info"))
+        
         elif msg_type == MessageType.PRIVATE_MESSAGE.value:
             from_id = message['from_id']
             try:
                 plaintext = self.crypto.decrypt(from_id, message['encrypted_data'], message['nonce'])
                 sender = self.users.get(from_id, {}).get('nickname', from_id)
+                
+                # Show notification for private message
+                if self.config.get("notifications", "on_pm", default=True):
+                    self.show_notification(
+                        f"Private message from {sender}",
+                        plaintext[:100] + ('...' if len(plaintext) > 100 else '')
+                    )
                 
                 # Check if it's an action message
                 prefix = f"* {sender} "
@@ -1459,11 +1767,27 @@ class IRCClientGUI:
             if channel in self.channel_users and user_id:
                 self.channel_users[channel].discard(user_id)
             
-            self.root.after(0, lambda: self.log(f"{nickname} left {channel}", "system"))
+            # Remove from operator/mod lists
+            if channel in self.channel_operators:
+                self.channel_operators[channel].discard(user_id)
+            if channel in self.channel_mods:
+                self.channel_mods[channel].discard(user_id)
             
-            # Update channel user list if viewing this channel
-            if self.current_channel == channel:
-                self.root.after(0, self._update_channel_user_list)
+            # If we left the channel, update our state
+            if user_id == self.user_id:
+                self.joined_channels.discard(channel)
+                if self.current_channel == channel:
+                    self.current_channel = None
+                self.root.after(0, self._update_channel_list)  # Update UI
+                self.root.after(0, self.update_context_label)
+                self.root.after(0, lambda: self.log(f"Left {channel}", "info"))
+            else:
+                # Someone else left
+                self.root.after(0, lambda: self.log(f"{nickname} left {channel}", "system"))
+                
+                # Update channel user list if viewing this channel
+                if self.current_channel == channel:
+                    self.root.after(0, self._update_channel_user_list)
         
         elif msg_type == MessageType.DISCONNECT.value:
             user_id = message.get('user_id')
@@ -1506,6 +1830,9 @@ class IRCClientGUI:
             whois_info = f"Whois {nickname}:\n  Channels: {channel_list}\n  Status: Online"
             self.root.after(0, lambda: self.log(whois_info, "info"))
         
+        elif msg_type == MessageType.PROFILE_RESPONSE.value:
+            self._handle_profile_response(message)
+        
         elif msg_type == MessageType.CHANNEL_LIST_RESPONSE.value:
             channels = message.get('channels', [])
             if channels:
@@ -1529,6 +1856,10 @@ class IRCClientGUI:
             else:
                 self.channel_operators[channel] = {user_id}
             
+            # If this is us, update our saved channel config
+            if user_id == self.user_id:
+                self._save_channel_to_config(channel)
+            
             self.root.after(0, lambda: self.log(f"{nickname} was granted operator status by {granted_by} in {channel}", "system"))
             if self.current_channel == channel:
                 self.root.after(0, self._update_channel_user_list)
@@ -1542,6 +1873,10 @@ class IRCClientGUI:
             
             if channel in self.channel_operators:
                 self.channel_operators[channel].discard(user_id)
+            
+            # If this is us, update our saved channel config
+            if user_id == self.user_id:
+                self._save_channel_to_config(channel)
             
             self.root.after(0, lambda: self.log(f"{nickname} had operator status removed by {removed_by} in {channel}", "system"))
             if self.current_channel == channel:
@@ -1559,6 +1894,10 @@ class IRCClientGUI:
             else:
                 self.channel_mods[channel] = {user_id}
             
+            # If this is us, update our saved channel config
+            if user_id == self.user_id:
+                self._save_channel_to_config(channel)
+            
             self.root.after(0, lambda: self.log(f"{nickname} was granted mod status by {granted_by} in {channel}", "system"))
             if self.current_channel == channel:
                 self.root.after(0, self._update_channel_user_list)
@@ -1572,6 +1911,10 @@ class IRCClientGUI:
             
             if channel in self.channel_mods:
                 self.channel_mods[channel].discard(user_id)
+            
+            # If this is us, update our saved channel config
+            if user_id == self.user_id:
+                self._save_channel_to_config(channel)
             
             self.root.after(0, lambda: self.log(f"{nickname} had mod status removed by {removed_by} in {channel}", "system"))
             if self.current_channel == channel:
@@ -1616,6 +1959,26 @@ class IRCClientGUI:
                 self.root.after(0, lambda c=channel, s=set_by:
                               self.log(f"[{c}] Topic cleared by {s}", "info"))
         
+        elif msg_type == MessageType.MODE_CHANGE.value:
+            channel = message.get('channel')
+            mode = message.get('mode')
+            enabled = message.get('enabled')
+            set_by = message.get('set_by', 'unknown')
+            
+            mode_names = {
+                'm': 'moderated',
+                's': 'secret',
+                'i': 'invite-only',
+                'n': 'no external messages',
+                'p': 'private'
+            }
+            mode_name = mode_names.get(mode, mode)
+            action = "enabled" if enabled else "disabled"
+            prefix = '+' if enabled else '-'
+            
+            self.root.after(0, lambda c=channel, m=mode, n=mode_name, a=action, s=set_by, p=prefix: 
+                          self.log(f"[{c}] {s} {a} mode {p}{m} ({n})", "system"))
+        
         elif msg_type == MessageType.BAN_USER.value:
             # You were banned from a channel
             channel = message.get('channel')
@@ -1649,33 +2012,65 @@ class IRCClientGUI:
             
             self.root.after(0, lambda: self.log(f"You were unbanned from {channel} by {unbanned_by}", "success"))
         
+        elif msg_type == MessageType.INVITE_USER.value:
+            # You were invited to a channel
+            channel = message.get('channel')
+            inviter_nickname = message.get('inviter_nickname')
+            inviter_id = message.get('inviter_id')
+            
+            # Show invite dialog
+            self.root.after(0, lambda: UIDialogs.show_invite_dialog(self.root, channel, inviter_nickname, inviter_id, self.send_invite_response))
+        
         elif msg_type == MessageType.OP_PASSWORD_REQUEST.value:
             channel = message.get('channel')
             action = message.get('action')
+            granted_by = message.get('granted_by')  # Who is granting the role
+            is_mod = message.get('is_mod', False)  # Is this for mod role?
             
             # Request password from user
             if action == 'set':
-                self.root.after(0, lambda: self._prompt_op_password(channel, is_new=True))
+                self.root.after(0, lambda: self._prompt_op_password(channel, is_new=True, granted_by=granted_by, is_mod=is_mod))
             else:  # verify
-                self.root.after(0, lambda: self._prompt_op_password(channel, is_new=False))
+                self.root.after(0, lambda: self._prompt_op_password(channel, is_new=False, granted_by=granted_by, is_mod=is_mod))
         
-        elif msg_type == MessageType.ERROR.value:
-            error = message.get('error')
-            self.root.after(0, lambda: self.log(f"Error: {error}", "error"))
+        # Note: ERROR messages are handled by presenter._handle_error()
+        # which calls _on_error() callback to log the error
     
     def _update_channel_list(self):
         """Update channel list box"""
         self.channel_list.delete(0, tk.END)
-        for channel in sorted(self.joined_channels):
-            # Add padlock symbol for protected channels
-            display_name = f"🔒 {channel}" if channel in self.protected_channels else channel
-            self.channel_list.insert(tk.END, display_name)
+        
+        # First, add joined channels (only when connected)
+        if self.connected:
+            for channel in sorted(self.joined_channels):
+                # Add padlock symbol for protected channels
+                display_name = f"🔒 {channel}" if channel in self.protected_channels else channel
+                self.channel_list.insert(tk.END, display_name)
+        
+        # Then, add saved channels we're not currently in (show always for easy access)
+        saved_channels = self.config.get("saved_channels", default={})
+        for channel in sorted(saved_channels.keys()):
+            if channel not in self.joined_channels:
+                # Show with a different indicator (dim/italics not available, use prefix)
+                display_name = f"💾 {channel}"
+                self.channel_list.insert(tk.END, display_name)
     
     def _update_user_list(self):
-        """Update user list box"""
+        """Update user list box with status icons"""
         self.user_list.delete(0, tk.END)
+        
+        status_icons = {
+            'online': '🟢',
+            'away': '🟡',
+            'busy': '🔴',
+            'dnd': '⛔'
+        }
+        
         for user_id, info in self.users.items():
-            self.user_list.insert(tk.END, info['nickname'])
+            status = info.get('status', 'online')
+            icon = status_icons.get(status, '🟢')
+            display_name = f"{icon} {info['nickname']}"
+            self.user_list.insert(tk.END, display_name)
     
     def _update_channel_user_list(self):
         """Update channel user list for current channel with symbols and colors"""
@@ -1705,10 +2100,23 @@ class IRCClientGUI:
         # Sort: owner first, then ops, then mods, then alphabetically by nickname
         members_with_info.sort(key=lambda x: (not x[2], not x[3], not x[4], x[0].lower()))
         
-        # Add to listbox with symbols
+        # Add to listbox with symbols and status icons
+        status_icons = {
+            'online': '🟢',
+            'away': '🟡',
+            'busy': '🔴',
+            'dnd': '⛔'
+        }
+        
         for i, (nickname, user_id, is_owner, is_op, is_mod) in enumerate(members_with_info):
             symbol = self.config.get_role_symbol(is_owner=is_owner, is_op=is_op, is_mod=is_mod)
-            display_name = f"{symbol} {nickname}"
+            
+            # Get status icon
+            user_info = self.users.get(user_id, {})
+            status = user_info.get('status', 'online')
+            status_icon = status_icons.get(status, '🟢')
+            
+            display_name = f"{symbol} {status_icon} {nickname}"
             
             self.channel_user_list.insert(tk.END, display_name)
             
@@ -1728,19 +2136,150 @@ class IRCClientGUI:
         if selection:
             idx = selection[0]
             display_name = self.channel_list.get(idx)
-            # Strip padlock emoji if present
-            channel = display_name.replace('🔒 ', '')
+            # Strip any emoji prefixes (🔒 for protected, 💾 for saved)
+            channel = display_name.replace('🔒 ', '').replace('💾 ', '')
             self.current_channel = channel
             self.current_recipient = None  # Clear PM mode
             self.set_status(f"Channel: {self.current_channel}")
             self.update_context_label()
             self._update_channel_user_list()  # Update channel users display
     
+    def on_channel_double_click(self, event):
+        """Handle double-click on channel to rejoin if not currently in it"""
+        selection = self.channel_list.curselection()
+        if not selection:
+            return
+        
+        idx = selection[0]
+        display_name = self.channel_list.get(idx)
+        # Strip any emoji prefixes (🔒 for protected, 💾 for saved)
+        channel = display_name.replace('🔒 ', '').replace('💾 ', '')
+        
+        # If we're already in this channel, switch to it
+        if channel in self.joined_channels:
+            self.current_channel = channel
+            self.current_recipient = None
+            self.set_status(f"Channel: {self.current_channel}")
+            self.update_context_label()
+            self._update_channel_user_list()
+        else:
+            # Not in channel yet - check if connected first
+            if not self.connected:
+                messagebox.showinfo("Not Connected", 
+                                   f"Please connect to the server before joining {channel}")
+                return
+            
+            # Try to rejoin - server will handle authentication
+            # Server will prompt for operator_password if user has operator/mod status
+            asyncio.run_coroutine_threadsafe(
+                self._join_channel(channel, password=None),
+                self.loop
+            )
+    
+    def on_channel_right_click(self, event):
+        """Handle right-click on channel to show context menu"""
+        # Select the item under cursor
+        idx = self.channel_list.nearest(event.y)
+        if idx >= 0:
+            self.channel_list.selection_clear(0, tk.END)
+            self.channel_list.selection_set(idx)
+            
+            display_name = self.channel_list.get(idx)
+            # Strip any emoji prefixes (🔒 for protected, 💾 for saved)
+            channel = display_name.replace('🔒 ', '').replace('💾 ', '')
+            
+            # Show context menu
+            menu = tk.Menu(self.root, tearoff=0)
+            
+            if channel in self.joined_channels:
+                menu.add_command(label=f"Leave {channel}", command=lambda: self._leave_channel_from_menu(channel))
+            else:
+                menu.add_command(label=f"Rejoin {channel}", command=lambda: self._rejoin_channel_from_menu(channel))
+                menu.add_command(label=f"Join as Owner (creator password)", command=lambda: self._prompt_operator_password_for_rejoin(channel, is_owner=True))
+                menu.add_separator()
+                menu.add_command(label=f"Remove from saved", command=lambda: self._remove_channel_from_config(channel))
+            
+            menu.post(event.x_root, event.y_root)
+    
+    def _leave_channel_from_menu(self, channel: str):
+        """Leave a channel from right-click menu"""
+        asyncio.run_coroutine_threadsafe(
+            self.presenter.leave_channel(channel),
+            self.loop
+        )
+    
+    def _rejoin_channel_from_menu(self, channel: str):
+        """Rejoin a channel from right-click menu"""
+        # Check if connected first
+        if not self.connected:
+            messagebox.showinfo("Not Connected", 
+                               f"Please connect to the server before joining {channel}")
+            return
+        
+        # Check if user had a role that requires operator password
+        # Try to rejoin - server will handle authentication
+        # Server will prompt for operator_password if user has operator/mod status
+        asyncio.run_coroutine_threadsafe(
+            self._join_channel(channel, password=None),
+            self.loop
+        )
+    
+    def _prompt_operator_password_for_rejoin(self, channel: str, is_owner: bool = False):
+        """Prompt for creator password when rejoining a channel as owner"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Rejoin {channel}")
+        dialog.geometry("450x220")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        
+        # Apply theme colors
+        colors = self.config.get_theme_colors()
+        dialog.config(bg=colors['bg'])
+        
+        ttk.Label(dialog, text=f"Enter creator password for {channel}:", 
+                 font=('Segoe UI', 10, 'bold')).pack(pady=15)
+        ttk.Label(dialog, text="(Required because you are the channel owner)", 
+                 font=('Segoe UI', 8)).pack(pady=(0, 10))
+        
+        password_entry = ttk.Entry(dialog, show="*", width=40)
+        password_entry.pack(pady=15, padx=20)
+        
+        def on_submit():
+            password = password_entry.get()
+            if password:
+                dialog.destroy()
+                # Pass password as creator_password to regain owner status
+                asyncio.run_coroutine_threadsafe(
+                    self._join_channel(channel, password=None, creator_password=password),
+                    self.loop
+                )
+            else:
+                messagebox.showwarning("Warning", "Password required", parent=dialog)
+        
+        def on_cancel():
+            dialog.destroy()
+        
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=15)
+        ttk.Button(btn_frame, text="Rejoin", command=on_submit, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel, width=10).pack(side=tk.LEFT, padx=5)
+        
+        password_entry.bind('<Return>', lambda e: on_submit())
+        password_entry.bind('<Escape>', lambda e: on_cancel())
+        
+        # Make dialog modal and set focus after all widgets are created
+        dialog.update_idletasks()  # Ensure window is rendered
+        dialog.grab_set()
+        password_entry.focus()
+    
     def on_user_double_click(self, event):
         """Handle double-click on user (start PM)"""
         selection = self.user_list.curselection()
         if selection:
-            nickname = self.user_list.get(selection[0])
+            display_name = self.user_list.get(selection[0])
+            # Extract nickname from "status_icon nickname" format
+            parts = display_name.split()
+            nickname = parts[-1] if parts else display_name
             self.current_channel = None  # Switch to PM mode
             self.current_recipient = nickname
             self.set_status(f"PM to: {nickname}")
@@ -1748,7 +2287,7 @@ class IRCClientGUI:
             self.message_entry.focus()
     
     def send_message(self):
-        """Send message or execute command"""
+        """Send message or execute command - Uses presenter"""
         text = self.message_entry.get().strip()
         if not text or not self.connected:
             return
@@ -1757,356 +2296,106 @@ class IRCClientGUI:
         if text.startswith('/'):
             self.message_entry.delete(0, tk.END)
             asyncio.run_coroutine_threadsafe(
-                self.handle_slash_command(text),
+                self.command_handler.handle_command(text),
                 self.loop
             )
             return
         
-        # Normal message
-        target = self.current_channel if self.current_channel else self.current_recipient
-        if not target:
-            self.log("Select a channel or user first", "error")
+        # Normal message via presenter
+        if not self.loop:
+            self.log("Not connected", "error")
             return
         
-        # Send message
-        if self.current_channel:
-            asyncio.run_coroutine_threadsafe(
-                self._send_channel_message(self.current_channel, text),
-                self.loop
-            )
-        elif self.current_recipient:
-            asyncio.run_coroutine_threadsafe(
-                self._send_private_message(self.current_recipient, text),
-                self.loop
-            )
+        # Send via presenter
+        asyncio.run_coroutine_threadsafe(
+            self.presenter.send_message(text),
+            self.loop
+        )
         
         self.message_entry.delete(0, tk.END)
     
-    async def handle_slash_command(self, text: str):
-        """Handle IRC slash commands"""
-        parts = text.split(maxsplit=1)
-        cmd = parts[0].lower()
-        args = parts[1] if len(parts) > 1 else ""
+    def _parse_duration(self, duration_str: str) -> int:
+        """Parse duration string like '30m', '1h', '2h30m' into seconds.
+        Returns None if parsing fails."""
+        import re
         
-        if cmd == '/me':
-            # Action message
-            if not args:
-                self.root.after(0, lambda: self.log("Usage: /me <action>", "error"))
-                return
+        try:
+            # Match patterns like: 1h, 30m, 1h30m, 2h15m
+            pattern = r'^(?:(\d+)h)?(?:(\d+)m)?$'
+            match = re.match(pattern, duration_str.lower())
             
-            action_text = f"* {self.nickname} {args}"
+            if not match:
+                return None
             
-            if self.current_channel:
-                # Send to channel
-                for user_id, info in self.users.items():
-                    if user_id != self.user_id:
-                        try:
-                            encrypted_data, nonce = self.crypto.encrypt(user_id, action_text)
-                            msg = Protocol.encrypted_message(
-                                self.user_id, self.current_channel, encrypted_data, nonce, is_channel=True
-                            )
-                            await self.send_to_server(msg)
-                        except Exception:
-                            pass
-                # Echo
-                self.root.after(0, lambda: self.log(f"[{self.current_channel}] {action_text}", "action"))
+            hours, minutes = match.groups()
+            total_seconds = 0
             
-            elif self.current_recipient:
-                # Send as PM
-                target_id = None
-                for uid, info in self.users.items():
-                    if info['nickname'] == self.current_recipient:
-                        target_id = uid
-                        break
-                if target_id:
-                    encrypted_data, nonce = self.crypto.encrypt(target_id, action_text)
-                    msg = Protocol.encrypted_message(
-                        self.user_id, target_id, encrypted_data, nonce, is_channel=False
-                    )
-                    await self.send_to_server(msg)
-                    self.root.after(0, lambda: self.log(f"[PM to {self.current_recipient}] {action_text}", "action"))
+            if hours:
+                total_seconds += int(hours) * 3600
+            if minutes:
+                total_seconds += int(minutes) * 60
+            
+            # Must have at least some duration
+            return total_seconds if total_seconds > 0 else None
+            
+        except:
+            return None
+    
+    async def _send_channel_message(self, channel: str, text: str):
+        """Send message to channel - DEPRECATED: Use presenter"""
+        # This method is kept for backward compatibility with command handler
+        # New code should use presenter.send_message() directly
+        await self.presenter.send_message(text)
+    
+    async def _send_status_update(self, status: str, custom_message: str = ""):
+        """Send status update to server"""
+        try:
+            msg = Protocol.set_status(status, custom_message)
+            await self.send_to_server(msg)
+        except Exception as e:
+            error_msg = str(e)
+            self.root.after(0, lambda: self.log(f"Failed to update status: {error_msg}", "error"))
+    
+    def send_status(self, status: str, custom_message: str = ""):
+        """Callback for status dialog - updates local state and sends to server"""
+        # Update local state
+        self.current_status = status
+        self.current_status_message = custom_message
         
-        elif cmd == '/op':
-            # Grant operator status (requires password)
-            if not self.current_channel:
-                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
-                return
-            if not args:
-                self.root.after(0, lambda: self.log("Usage: /op <user>", "error"))
-                return
-            
-            target_nickname = args.strip()
-            # Will need password - show dialog
-            self.root.after(0, lambda: self.op_user_dialog_for_user(target_nickname))
-        
-        elif cmd == '/mod':
-            # Grant mod status (no password needed)
-            if not self.current_channel:
-                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
-                return
-            if not args:
-                self.root.after(0, lambda: self.log("Usage: /mod <user>", "error"))
-                return
-            
-            target_nickname = args.strip()
-            msg = Protocol.build_message(MessageType.MOD_USER, channel=self.current_channel, target_nickname=target_nickname)
+        # Send to server
+        if self.loop and self.running:
             asyncio.run_coroutine_threadsafe(
-                self.send_to_server(msg),
+                self._send_status_update(status, custom_message),
                 self.loop
             )
         
-        elif cmd == '/join':
-            if not args:
-                self.root.after(0, lambda: self.log(
-                    "Usage: /join #channel [join_password] [creator_password]\n"
-                    "  - For new channels: creator_password required (4+ chars)\n"
-                    "  - For existing channels: use creator_password to regain operator status",
-                    "error"
-                ))
-                return
-            parts = args.split(maxsplit=2)
-            channel = parts[0]
-            # Prepend '#' if not already present
-            if not channel.startswith('#'):
-                channel = '#' + channel
-            join_password = parts[1] if len(parts) > 1 else None
-            creator_password = parts[2] if len(parts) > 2 else join_password  # If only one password, use for both
-            await self._join_channel(channel, join_password, creator_password)
-        
-        elif cmd == '/leave' or cmd == '/part':
-            channel = args.strip() if args else self.current_channel
-            if channel:
-                await self._leave_channel(channel)
-            else:
-                self.root.after(0, lambda: self.log("Usage: /leave [channel]", "error"))
-        
-        elif cmd == '/msg' or cmd == '/query':
-            parts = args.split(maxsplit=1)
-            if len(parts) < 2:
-                self.root.after(0, lambda: self.log("Usage: /msg <user> <message>", "error"))
-                return
-            await self._send_private_message(parts[0], parts[1])
-        
-        elif cmd == '/image':
-            parts = args.split(maxsplit=1)
-            if len(parts) < 2:
-                self.root.after(0, lambda: self.log("Usage: /image <user> <filepath>", "error"))
-                return
-            await self._send_image(parts[0], parts[1])
-        
-        elif cmd == '/users':
-            if self.users:
-                user_list = "Online users:\n" + "\n".join(f"  • {info['nickname']}" for uid, info in self.users.items())
-                self.root.after(0, lambda: self.log(user_list, "info"))
-            else:
-                self.root.after(0, lambda: self.log("No users online", "info"))
-        
-        elif cmd == '/whois':
-            if not args:
-                self.root.after(0, lambda: self.log("Usage: /whois <nickname>", "error"))
-                return
-            nickname = args.strip()
-            msg = Protocol.whois(nickname)
-            await self.send_to_server(msg)
-        
-        elif cmd == '/list':
-            msg = Protocol.list_channels()
-            await self.send_to_server(msg)
-        
-        elif cmd == '/kick':
-            if not self.current_channel:
-                self.root.after(0, lambda: self.log("You must be in a channel to use /kick", "error"))
-                return
-            parts = args.split(maxsplit=1)
-            if not parts:
-                self.root.after(0, lambda: self.log("Usage: /kick <user> [reason]", "error"))
-                return
-            target_nickname = parts[0]
-            reason = parts[1] if len(parts) > 1 else "No reason given"
-            msg = Protocol.kick_user(self.current_channel, target_nickname, reason)
-            await self.send_to_server(msg)
-        
-        elif cmd == '/topic':
-            if not self.current_channel:
-                self.root.after(0, lambda: self.log("You must be in a channel to use /topic", "error"))
-                return
-            if not args:
-                self.root.after(0, lambda: self.log("Usage: /topic <new topic>", "error"))
-                return
-            topic = args.strip()
-            msg = Protocol.set_topic(self.current_channel, topic)
-            await self.send_to_server(msg)
-        
-        elif cmd == '/unop':
-            if not self.current_channel:
-                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
-                return
-            if not args:
-                self.root.after(0, lambda: self.log("Usage: /unop <user>", "error"))
-                return
-            target_nickname = args.strip()
-            msg = Protocol.build_message(MessageType.UNOP_USER, channel=self.current_channel, target_nickname=target_nickname)
-            await self.send_to_server(msg)
-        
-        elif cmd == '/unmod':
-            if not self.current_channel:
-                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
-                return
-            if not args:
-                self.root.after(0, lambda: self.log("Usage: /unmod <user>", "error"))
-                return
-            target_nickname = args.strip()
-            msg = Protocol.build_message(MessageType.UNMOD_USER, channel=self.current_channel, target_nickname=target_nickname)
-            await self.send_to_server(msg)
-        
-        elif cmd == '/ban':
-            if not self.current_channel:
-                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
-                return
-            parts = args.split(maxsplit=1)
-            if not parts:
-                self.root.after(0, lambda: self.log("Usage: /ban <user> [reason]", "error"))
-                return
-            target_nickname = parts[0]
-            reason = parts[1] if len(parts) > 1 else "No reason given"
-            msg = Protocol.build_message(MessageType.BAN_USER, channel=self.current_channel, target_nickname=target_nickname, reason=reason)
-            await self.send_to_server(msg)
-        
-        elif cmd == '/kickban':
-            if not self.current_channel:
-                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
-                return
-            parts = args.split(maxsplit=1)
-            if not parts:
-                self.root.after(0, lambda: self.log("Usage: /kickban <user> [reason]", "error"))
-                return
-            target_nickname = parts[0]
-            reason = parts[1] if len(parts) > 1 else "No reason given"
-            msg = Protocol.build_message(MessageType.KICKBAN_USER, channel=self.current_channel, target_nickname=target_nickname, reason=reason)
-            await self.send_to_server(msg)
-        
-        elif cmd == '/unban':
-            if not self.current_channel:
-                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
-                return
-            if not args:
-                self.root.after(0, lambda: self.log("Usage: /unban <user>", "error"))
-                return
-            target_nickname = args.strip()
-            msg = Protocol.build_message(MessageType.UNBAN_USER, channel=self.current_channel, target_nickname=target_nickname)
-            await self.send_to_server(msg)
-        
-        elif cmd == '/transfer':
-            if not self.current_channel:
-                self.root.after(0, lambda: self.log("You must be in a channel", "error"))
-                return
-            if not args:
-                self.root.after(0, lambda: self.log("Usage: /transfer <operator_nickname>", "error"))
-                return
-            target_nickname = args.strip()
-            msg = Protocol.build_message(MessageType.TRANSFER_OWNERSHIP, channel=self.current_channel, target_nickname=target_nickname)
-            await self.send_to_server(msg)
-        
-        elif cmd == '/history':
-            # Show message history
-            if not self.history:
-                self.root.after(0, lambda: self.log("Message history is not enabled. Enable it in settings.", "error"))
-                return
-            
-            limit = 50
-            if args:
-                try:
-                    limit = int(args.strip())
-                except ValueError:
-                    self.root.after(0, lambda: self.log("Usage: /history [limit]", "error"))
-                    return
-            
-            messages = self.history.get_messages(channel=self.current_channel, limit=limit)
-            if messages:
-                self.root.after(0, lambda: self.log(f"=== Last {len(messages)} messages ===", "info"))
-                for msg in messages:
-                    timestamp = msg['datetime'].strftime('%H:%M:%S')
-                    ch = f"[{msg['channel']}] " if msg['channel'] else "[PM] "
-                    self. root.after(0, lambda t=timestamp, c=ch, s=msg['sender'], m=msg['content']: 
-                                    self.log(f"{t} {c}<{s}> {m}", "info"))
-            else:
-                self.root.after(0, lambda: self.log("No message history found", "info"))
-        
-        elif cmd == '/search':
-            # Search message history
-            if not self.history:
-                self.root.after(0, lambda: self.log("Message history is not enabled. Enable it in settings.", "error"))
-                return
-            
-            if not args:
-                self.root.after(0, lambda: self.log("Usage: /search <query>", "error"))
-                return
-            
-            query = args.strip()
-            messages = self.history.search_messages(query, channel=self.current_channel, limit=30)
-            if messages:
-                self.root.after(0, lambda: self.log(f"=== Found {len(messages)} messages matching '{query}' ===", "info"))
-                for msg in messages:
-                    timestamp = msg['datetime'].strftime('%Y-%m-%d %H:%M')
-                    ch = f"[{msg['channel']}] " if msg['channel'] else "[PM] "
-                    self.root.after(0, lambda t=timestamp, c=ch, s=msg['sender'], m=msg['content']: 
-                                    self.log(f"{t} {c}<{s}> {m}", "info"))
-            else:
-                self.root.after(0, lambda: self.log(f"No messages found matching '{query}'", "info"))
-        
-        elif cmd == '/export':
-            # Export message history
-            if not self.history:
-                self.root.after(0, lambda: self.log("Message history is not enabled. Enable it in settings.", "error"))
-                return
-            
-            # Show file dialog
-            def do_export():
-                filepath = filedialog.asksaveasfilename(
-                    title="Export Message History",
-                    defaultextension=".txt",
-                    filetypes=[("Text files", "*.txt"), ("JSON files", "*.json"), ("All files", "*.*")]
-                )
-                if filepath:
-                    try:
-                        if filepath.endswith('.json'):
-                            self.history.export_to_json(filepath, channel=self.current_channel)
-                        else:
-                            self.history.export_to_text(filepath, channel=self.current_channel)
-                        self.log(f"History exported to {filepath}", "success")
-                    except Exception as e:
-                        self.log(f"Export failed: {e}", "error")
-            
-            self.root.after(0, do_export)
-        
-        elif cmd == '/quit':
-            self.running = False
-            self.disconnect()
-        
-        elif cmd == '/help':
-            self.root.after(0, self.show_help)
-        
-        else:
-            self.root.after(0, lambda: self.log(f"Unknown command: {cmd}. Type /help for available commands", "error"))
+        # Show confirmation
+        status_names = {
+            "online": "🟢 Online",
+            "away": "🟡 Away", 
+            "busy": "🔴 Busy",
+            "dnd": "⛔ Do Not Disturb"
+        }
+        self.log(f"Status set to: {status_names.get(status, status)}", "success")
     
-    async def _send_channel_message(self, channel: str, text: str):
-        """Send message to channel"""
-        if channel not in self.joined_channels:
-            return
-        
-        for user_id, info in self.users.items():
-            if user_id != self.user_id:
-                try:
-                    encrypted_data, nonce = self.crypto.encrypt(user_id, text)
-                    msg = Protocol.encrypted_message(
-                        self.user_id, channel, encrypted_data, nonce, is_channel=True
-                    )
-                    await self.send_to_server(msg)
-                except Exception:
-                    pass
-        
-        # Echo own message
-        self.root.after(0, lambda: self.log_chat(self.nickname, text, channel))
+    def send_invite_response(self, channel: str, inviter_nickname: str, accepted: bool):
+        """Callback for invite dialog - sends response to server"""
+        msg = Protocol.invite_response(channel, inviter_nickname, accepted)
+        asyncio.run_coroutine_threadsafe(
+            self.send_to_server(msg),
+            self.loop
+        )
+        if accepted:
+            self.log(f"Joined {channel}", "success")
+        else:
+            self.log(f"Declined invite to {channel}", "system")
+    
+    def insert_emoji(self, emoji: str):
+        """Callback for emoji picker - inserts emoji at cursor position"""
+        cursor_pos = self.message_entry.index(tk.INSERT)
+        self.message_entry.insert(cursor_pos, emoji)
+        self.message_entry.focus()
+
     
     def op_user_dialog(self):
         """Show op user dialog"""
@@ -2124,12 +2413,16 @@ class IRCClientGUI:
             messagebox.showwarning("Warning", "Select a user first")
             return
         
-        target_nickname = self.user_list.get(selection[0])
+        # Get display name and strip status emoji
+        display_name = self.user_list.get(selection[0])
+        # Extract nickname from "status_icon nickname" format
+        parts = display_name.split()
+        target_nickname = parts[-1] if parts else display_name
         
-        # Create simple confirmation dialog (no password needed for verified operators)
+        # Create dialog to get operator password for the new operator
         dialog = tk.Toplevel(self.root)
         dialog.title("Grant Operator Status")
-        dialog.geometry("350x120")
+        dialog.geometry("400x180")
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -2137,33 +2430,32 @@ class IRCClientGUI:
         colors = self.config.get_theme_colors()
         dialog.config(bg=colors['bg'])
         
-        # Message
-        msg_frame = ttk.Frame(dialog, padding=20)
-        msg_frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(dialog, text=f"Grant operator status to {target_nickname}", font=('Arial', 10, 'bold')).pack(pady=15)
         
-        ttk.Label(
-            msg_frame,
-            text=f"Grant operator status to {target_nickname}?",
-            font=('Arial', 10, 'bold')
-        ).pack(pady=(0, 10))
+        ttk.Label(dialog, text="Set operator password for user (4+ chars):").pack(anchor=tk.W, padx=20)
+        password_entry = ttk.Entry(dialog, width=40, show='*')
+        password_entry.pack(padx=20, fill=tk.X, pady=5)
+        password_entry.focus()
         
-        # Buttons
         btn_frame = ttk.Frame(dialog)
-        btn_frame.pack(pady=10)
+        btn_frame.pack(pady=15)
         
-        def on_op():
+        def grant():
+            password = password_entry.get().strip()
+            if len(password) < 4:
+                messagebox.showerror("Error", "Operator password must be at least 4 characters")
+                return
             dialog.destroy()
-            # Send op command (no password needed)
             asyncio.run_coroutine_threadsafe(
-                self._op_user(target_nickname, ""),
+                self._op_user(target_nickname, password),
                 self.loop
             )
         
-        def on_cancel():
-            dialog.destroy()
+        ttk.Button(btn_frame, text="Grant", command=grant, width=10).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy, width=10).pack(side=tk.LEFT)
         
-        ttk.Button(btn_frame, text="Grant Op", command=on_op, width=12).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Cancel", command=on_cancel, width=12).pack(side=tk.LEFT, padx=5)
+        # Bind enter key
+        password_entry.bind('<Return>', lambda e: grant())
     
     async def _op_user(self, target_nickname: str, password: str):
         """Grant operator status to a user"""
@@ -2178,38 +2470,81 @@ class IRCClientGUI:
         self.root.after(0, lambda: self.log(f"Kicking {target_nickname} from {self.current_channel}...", "info"))
     
     async def _send_private_message(self, target_nickname: str, text: str):
-        """Send private message to user"""
-        # Find user ID
-        target_id = None
-        for uid, info in self.users.items():
-            if info['nickname'] == target_nickname:
-                target_id = uid
-                break
+        """Send private message to user -  DEPRECATED: Use presenter"""
+        # This method is kept for backward compatibility with command handler
+        # New code should use presenter.send_private_message_to() directly
+        await self.presenter.send_private_message_to(target_nickname, text)
+    
+
+    
+    def _show_creator_password_dialog(self, error_msg: str):
+        """Show creator password dialog when creating a new channel"""
+        # Create dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("New Channel - Set Creator Password")
+        dialog.geometry("450x220")
+        dialog.transient(self.root)
+        dialog.grab_set()
         
-        if not target_id:
-            self.root.after(0, lambda: self.log(f"User {target_nickname} not found", "error"))
-            return
+        # Apply theme colors
+        colors = self.config.get_theme_colors()
+        dialog.config(bg=colors['bg'])
         
-        # Ensure we have their public key
-        if not self.crypto.has_peer_key(target_id):
-            self.root.after(0, lambda: self.log(f"No encryption key for {target_nickname}", "error"))
-            return
+        # Info frame
+        info_frame = ttk.Frame(dialog, padding=10)
+        info_frame.pack(fill=tk.BOTH, expand=True)
         
-        try:
-            # Encrypt message
-            encrypted_data, nonce = self.crypto.encrypt(target_id, text)
-            
-            # Send
-            msg = Protocol.encrypted_message(
-                self.user_id, target_id, encrypted_data, nonce, is_channel=False
+        ttk.Label(
+            info_frame,
+            text="Creating a new channel requires a creator password.",
+            font=('Arial', 10, 'bold')
+        ).pack(pady=(0, 5))
+        
+        ttk.Label(
+            info_frame,
+            text="This password lets you regain operator status if you rejoin later.",
+            font=('Arial', 9),
+            wraplength=400
+        ).pack(pady=(0, 15))
+        
+        # Password entry
+        ttk.Label(info_frame, text="Creator Password (4+ characters):").pack(anchor=tk.W)
+        password_entry = ttk.Entry(info_frame, width=40, show='*')
+        password_entry.pack(fill=tk.X, pady=5)
+        password_entry.focus()
+        
+        # Store the last attempted channel
+        last_channel = getattr(self, '_last_join_attempt', None)
+        
+        result = {'password': None, 'cancelled': False}
+        
+        def on_create():
+            password = password_entry.get().strip()
+            if len(password) < 4:
+                messagebox.showerror("Error", "Password must be at least 4 characters")
+                return
+            result['password'] = password
+            dialog.destroy()
+        
+        def on_cancel():
+            result['cancelled'] = True
+            dialog.destroy()
+        
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Create Channel", command=on_create, width=15).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel, width=15).pack(side=tk.LEFT, padx=5)
+        
+        password_entry.bind('<Return>', lambda e: on_create())
+        
+        dialog.wait_window()
+        
+        # If user provided password and didn't cancel, retry the join with creator_password
+        if result['password'] and not result['cancelled'] and last_channel:
+            asyncio.run_coroutine_threadsafe(
+                self._join_channel(last_channel, password=None, creator_password=result['password']),
+                self.loop
             )
-            await self.send_to_server(msg)
-            
-            # Echo own message
-            self.root.after(0, lambda: self.log_chat(f"To {target_nickname}", text, channel="PM", msg_type="msg"))
-        except Exception as e:
-            error_msg = str(e)
-            self.root.after(0, lambda: self.log(f"Failed to send PM: {error_msg}", "error"))
     
     def join_channel_dialog(self):
         """Show join channel dialog"""
@@ -2217,10 +2552,10 @@ class IRCClientGUI:
             messagebox.showwarning("Warning", "Not connected to server")
             return
         
-        # Create custom dialog for channel and passwords
+        # Create simple dialog for channel name and optional password
         dialog = tk.Toplevel(self.root)
         dialog.title("Join Channel")
-        dialog.geometry("450x220")
+        dialog.geometry("400x150")
         dialog.transient(self.root)
         dialog.grab_set()
         
@@ -2233,90 +2568,84 @@ class IRCClientGUI:
         channel_entry.grid(row=0, column=1, padx=10, pady=10)
         channel_entry.focus()
         
-        ttk.Label(dialog, text="Join password (optional):").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
-        join_password_entry = ttk.Entry(dialog, width=30, show="*")
-        join_password_entry.grid(row=1, column=1, padx=10, pady=5)
+        ttk.Label(dialog, text="Password (if protected):").grid(row=1, column=0, sticky=tk.W, padx=10, pady=5)
+        password_entry = ttk.Entry(dialog, width=30, show="*")
+        password_entry.grid(row=1, column=1, padx=10, pady=5)
         
-        ttk.Label(dialog, text="Creator password (for operator):").grid(row=2, column=0, sticky=tk.W, padx=10, pady=5)
-        creator_password_entry = ttk.Entry(dialog, width=30, show="*")
-        creator_password_entry.grid(row=2, column=1, padx=10, pady=5)
-        
-        hint_label = ttk.Label(
-            dialog, 
-            text="For new channels: creator password required (4+ chars)\nFor existing: use creator password to regain operator",
-            font=('Arial', 8)
-        )
-        hint_label.grid(row=3, column=0, columnspan=2, padx=10, pady=5)
-        
-        result = {'channel': None, 'join_password': None, 'creator_password': None}
+        result = {'channel': None, 'password': None}
         
         def on_join():
             channel = channel_entry.get().strip()
             # Prepend '#' if not already present
             if channel and not channel.startswith('#'):
                 channel = '#' + channel
-            join_pwd = join_password_entry.get().strip() or None
-            creator_pwd = creator_password_entry.get().strip() or None
-            
-            # If no creator password but has join password, use join password for both
-            if not creator_pwd and join_pwd:
-                creator_pwd = join_pwd
+            password = password_entry.get().strip() or None
             
             result['channel'] = channel
-            result['join_password'] = join_pwd
-            result['creator_password'] = creator_pwd
+            result['password'] = password
             dialog.destroy()
         
         def on_cancel():
             dialog.destroy()
         
         btn_frame = ttk.Frame(dialog)
-        btn_frame.grid(row=4, column=0, columnspan=2, pady=10)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=10)
         ttk.Button(btn_frame, text="Join", command=on_join).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
         
         channel_entry.bind('<Return>', lambda e: on_join())
-        join_password_entry.bind('<Return>', lambda e: on_join())
-        creator_password_entry.bind('<Return>', lambda e: on_join())
+        password_entry.bind('<Return>', lambda e: on_join())
         
         dialog.wait_window()
         
         if result['channel']:
             asyncio.run_coroutine_threadsafe(
-                self._join_channel(result['channel'], result['join_password'], result['creator_password']),
+                self._join_channel(result['channel'], result['password']),
                 self.loop
             )
     
     async def _join_channel(self, channel: str, password: str = None, creator_password: str = None):
-        """Join a channel"""
-        msg = Protocol.join_channel(self.user_id, channel, password, creator_password)
-        await self.send_to_server(msg)
+        """Join a channel - Uses presenter"""
+        # Store the last join attempt for potential creator password retry
+        self._last_join_attempt = channel
+        await self.presenter.join_channel(channel, password, creator_password)
     
     def leave_channel(self):
-        """Leave current channel"""
+        """Leave current channel - Uses presenter"""
         if not self.current_channel:
             messagebox.showwarning("Warning", "No channel selected")
             return
         
         asyncio.run_coroutine_threadsafe(
-            self._leave_channel(self.current_channel),
+            self.presenter.leave_channel(self.current_channel),
             self.loop
         )
     
     async def _leave_channel(self, channel: str):
-        """Leave a channel"""
-        msg = Protocol.leave_channel(self.user_id, channel)
-        await self.send_to_server(msg)
+        """Leave a channel - DEPRECATED: Use presenter"""
+        await self.presenter.leave_channel(channel)
+    
+    def _save_channel_to_config(self, channel_name: str):
+        """Save a channel to config for persistent rejoining
         
-        self.joined_channels.discard(channel)
-        if channel in self.channel_users:
-            del self.channel_users[channel]
+        Note: Only saves timestamp. Server determines ALL roles on rejoin.
+        """
+        saved_channels = self.config.get("saved_channels", default={})
         
-        if self.current_channel == channel:
-            self.current_channel = None
-        
-        self.root.after(0, self._update_channel_list)
-        self.root.after(0, self._update_channel_user_list)
+        # Only save timestamp - server is the source of truth for all roles
+        saved_channels[channel_name] = {
+            "joined_at": str(int(time.time()))
+        }
+        self.config.set("saved_channels", value=saved_channels)
+    
+    def _remove_channel_from_config(self, channel_name: str):
+        """Remove a channel from saved config"""
+        saved_channels = self.config.get("saved_channels", default={})
+        if channel_name in saved_channels:
+            del saved_channels[channel_name]
+            self.config.set("saved_channels", value=saved_channels)
+            # Update UI to remove the channel from list
+            self._update_channel_list()
     
     def send_image_dialog(self):
         """Show send image dialog"""
@@ -2330,7 +2659,10 @@ class IRCClientGUI:
             messagebox.showwarning("Warning", "Select a user first")
             return
         
-        nickname = self.user_list.get(selection[0])
+        display_name = self.user_list.get(selection[0])
+        # Extract nickname from "status_icon nickname" format
+        parts = display_name.split()
+        nickname = parts[-1] if parts else display_name
         
         # Select file
         filename = filedialog.askopenfilename(
@@ -2619,33 +2951,63 @@ class IRCClientGUI:
             self.context_label.config(text="Select a channel or user", foreground='gray')
     
     def disconnect(self):
-        """Disconnect from server"""
+        """Disconnect from server - Uses presenter"""
+        if not self.connected:
+            return
+            
         self.running = False
         self.connected = False
         
-        if self.loop and self.writer:
-            asyncio.run_coroutine_threadsafe(self._close_connection(), self.loop)
+        # Disable button during disconnection
+        self.connect_btn.config(state=tk.DISABLED)
+        self.server_entry.config(state=tk.NORMAL)
+        self.port_entry.config(state=tk.NORMAL)
+        self.nick_entry.config(state=tk.NORMAL)
+        self.set_status("Disconnecting...")
+        
+        # Disconnect via presenter which will close the connection
+        # This will cause the receive loop to exit naturally
+        if self.loop and not self.loop.is_closed():
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self.presenter.disconnect(),
+                    self.loop
+                )
+            except Exception as e:
+                print(f"Disconnect error: {e}")
+        
+        # Clean up UI and re-enable connect button
+        self.root.after(100, self._cleanup_after_disconnect)
     
-    async def _close_connection(self):
-        """Close connection"""
-        if self.writer:
-            self.writer.close()
-            await self.writer.wait_closed()
+    def _stop_event_loop(self):
+        """Stop the event loop if it exists"""
+        if self.loop and not self.loop.is_closed():
+            try:
+                self.loop.call_soon_threadsafe(self.loop.stop)
+            except:
+                pass
+    
+    def _cleanup_after_disconnect(self):
+        """Clean up UI after disconnect"""
+        # Update button back to Connect mode
+        self.connect_btn.config(text="Connect", command=self.connect, state=tk.NORMAL)
+        
+        # Clear user lists but keep channel list with saved channels
+        self._update_channel_list()  # Show saved channels
+        self.user_list.delete(0, tk.END)
+        self.channel_user_list.delete(0, tk.END)
+        self.set_status("Disconnected")
+        self.log("Disconnected from server", "info")
+        self.update_context_label()
     
     def _on_disconnected(self):
-        """Handle disconnection"""
+        """Handle disconnection event"""
+        # Just update connection status, don't duplicate cleanup
+        self._update_connection_status(False)
         self.connect_btn.config(state=tk.NORMAL)
         self.server_entry.config(state=tk.NORMAL)
         self.port_entry.config(state=tk.NORMAL)
         self.nick_entry.config(state=tk.NORMAL)
-        self.disconnect_btn.config(state=tk.DISABLED)
-        
-        self.channel_list.delete(0, tk.END)
-        self.user_list.delete(0, tk.END)
-        
-        self.set_status("Disconnected")
-        self.log("Disconnected from server", "info")
-        self.update_context_label()
 
 
 def main():
